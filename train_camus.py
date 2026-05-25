@@ -1,5 +1,9 @@
-# train_camus.py — Multi-GPU memory-optimized training of LAVT on the CAMUS dataset.
-# Adapted to run on 2x RTX A4000 (24GB) using Gradient Accumulation and DataParallel.
+# train_camus.py — Multi-GPU training of LAVT on the CAMUS dataset.
+# Runs on 2x RTX A4000 (24GB) using gradient accumulation and DataParallel.
+#
+# Usage:
+#   mkdir -p logs
+#   python train_camus.py 2>&1 | tee logs/baseline_run.txt
 
 import os
 import time
@@ -41,7 +45,6 @@ def get_transform(img_size):
 
 
 def criterion(output, target):
-    # Sends loss weighting array to current active device
     weight = torch.FloatTensor([0.9, 1.1]).to(output.device)
     return nn.functional.cross_entropy(output, target, weight=weight)
 
@@ -58,44 +61,36 @@ def IoU(pred, gt):
 def train_one_epoch(model, optimizer, data_loader, lr_scheduler, epoch, print_freq):
     model.train()
     running_loss = 0.0
-    n_batches = 0
-    
-    # Reset gradients explicitly at start of epoch loop
+    n_batches    = 0
     optimizer.zero_grad()
-    
+
     for i, data in enumerate(data_loader):
         image, target, sentences, attentions = data
-        image = image.cuda(non_blocking=True)
-        target = target.cuda(non_blocking=True)
-        sentences = sentences.cuda(non_blocking=True)
+        image      = image.cuda(non_blocking=True)
+        target     = target.cuda(non_blocking=True)
+        sentences  = sentences.cuda(non_blocking=True)
         attentions = attentions.cuda(non_blocking=True)
 
-        sentences = sentences.squeeze(1)
+        sentences  = sentences.squeeze(1)
         attentions = attentions.squeeze(1)
 
-        # Multi-GPU DataParallel splits batches along dim 0 here automatically
         output = model(image, sentences, l_mask=attentions)
+        loss   = criterion(output, target)
 
-        # 1. Base Segmentation Cross-Entropy
-        loss = criterion(output, target)
-        
-        # TODO: Add your multi-stage decoder activations contrastive loss here later.
-        # total_loss = loss + (config.CONTRASTIVE_WEIGHT * loss_contrastive)
-        total_loss = loss
-        
-        # 2. Gradient Accumulation Scaling
-        # Scales loss downward by accumulation factor to balance small physical steps
+        # TODO: add contrastive loss here when implementing CardioContrast
+        # loss_contrastive = contrastive_loss(decoder_activations, prompts)
+        # total_loss = loss + config.CONTRASTIVE_WEIGHT * loss_contrastive
+        total_loss  = loss
         scaled_loss = total_loss / config.GRADIENT_ACCUMULATION_STEPS
         scaled_loss.backward()
 
-        # 3. Step Optimizer only when accumulation step window matches target steps
         if (i + 1) % config.GRADIENT_ACCUMULATION_STEPS == 0 or (i + 1) == len(data_loader):
             optimizer.step()
             lr_scheduler.step()
-            optimizer.zero_grad() # Flush out accumulated tracking gradients cleanly
+            optimizer.zero_grad()
 
         running_loss += total_loss.item()
-        n_batches += 1
+        n_batches    += 1
 
         if i % print_freq == 0:
             print("Epoch [{}] step [{}/{}] loss {:.4f} lr {:.6f}".format(
@@ -112,24 +107,24 @@ def train_one_epoch(model, optimizer, data_loader, lr_scheduler, epoch, print_fr
 
 def evaluate(model, data_loader):
     model.eval()
-    acc_ious = 0
+    acc_ious  = 0
     total_its = 0
     cum_I, cum_U = 0, 0
     eval_seg_iou_list = [.5, .6, .7, .8, .9]
     seg_correct = np.zeros(len(eval_seg_iou_list), dtype=np.int32)
-    seg_total = 0
-    mean_IoU = []
+    seg_total   = 0
+    mean_IoU    = []
 
     with torch.no_grad():
         for data in data_loader:
             total_its += 1
             image, target, sentences, attentions = data
-            image = image.cuda(non_blocking=True)
-            target = target.cuda(non_blocking=True)
-            sentences = sentences.cuda(non_blocking=True)
+            image      = image.cuda(non_blocking=True)
+            target     = target.cuda(non_blocking=True)
+            sentences  = sentences.cuda(non_blocking=True)
             attentions = attentions.cuda(non_blocking=True)
 
-            sentences = sentences.squeeze(1)
+            sentences  = sentences.squeeze(1)
             attentions = attentions.squeeze(1)
 
             output = model(image, sentences, l_mask=attentions)
@@ -143,7 +138,7 @@ def evaluate(model, data_loader):
                 seg_correct[n] += (iou >= eval_seg_iou_list[n])
             seg_total += 1
 
-    mIoU = np.mean(np.array(mean_IoU)) if mean_IoU else 0.0
+    mIoU        = np.mean(np.array(mean_IoU)) if mean_IoU else 0.0
     overall_IoU = (100. * cum_I / cum_U) if cum_U > 0 else 0.0
     print("Mean IoU: {:.2f}".format(mIoU * 100), flush=True)
     print("Overall IoU: {:.2f}".format(overall_IoU), flush=True)
@@ -151,10 +146,11 @@ def evaluate(model, data_loader):
 
 
 def main():
-    assert torch.cuda.is_available(), "CUDA GPU required."
+    config.initialize_environment()
+    assert torch.cuda.is_available(), "CUDA GPU required. Run on the lab machine."
 
     model_args = build_model_args()
-    transform = get_transform(config.IMG_SIZE)
+    transform  = get_transform(config.IMG_SIZE)
 
     from data.dataset_camus import CAMUSDataset
     full_dataset = CAMUSDataset(
@@ -164,8 +160,14 @@ def main():
     )
     print("Total CAMUS examples: {}".format(len(full_dataset)), flush=True)
 
+    if len(full_dataset) == 0:
+        raise ValueError(
+            "No CAMUS samples found. Check that CAMUS_DATA_DIR in config.py "
+            "points to the database_nifti folder containing patient* subfolders."
+        )
+
     n_total = len(full_dataset)
-    n_val = int(0.2 * n_total)
+    n_val   = int(0.2 * n_total)
     n_train = n_total - n_val
     train_ds, val_ds = torch.utils.data.random_split(
         full_dataset, [n_train, n_val],
@@ -181,21 +183,16 @@ def main():
     print("Building model: {}".format(model_args.model), flush=True)
     model = segmentation.__dict__[model_args.model](
         pretrained=config.PRETRAINED_SWIN, args=model_args)
-    
-    # Enforces distribution across your workstation's dual devices
-    if len(config.GPU_IDS) > 1:
-        print(f"[+] Activating DataParallel execution on GPUs: {config.GPU_IDS}")
-        model = nn.DataParallel(model, device_ids=config.GPU_IDS)
-    
-    model.cuda()
 
-    # Param sorting structure adjusted for DataParallel wrapped setups
-    backbone_no_decay = []
-    backbone_decay = []
-    
-    # Access inner model attribute to extract parameters correctly if wrapped in DataParallel
+    if len(config.GPU_IDS) > 1:
+        print("Activating DataParallel on GPUs: {}".format(config.GPU_IDS))
+        model = nn.DataParallel(model, device_ids=config.GPU_IDS)
+
+    model.cuda()
     raw_model = model.module if isinstance(model, nn.DataParallel) else model
-    
+
+    backbone_no_decay = []
+    backbone_decay    = []
     for name, m in raw_model.backbone.named_parameters():
         if 'norm' in name or 'absolute_pos_embed' in name or 'relative_position_bias_table' in name:
             backbone_no_decay.append(m)
@@ -214,26 +211,24 @@ def main():
     optimizer = torch.optim.AdamW(
         params_to_optimize, lr=config.LR, weight_decay=config.WEIGHT_DECAY)
 
-    # Scale the learning rate lambda adjustment to account for gradient accumulation updates
+    total_steps = (len(train_loader) // config.GRADIENT_ACCUMULATION_STEPS) * config.EPOCHS
     lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
         optimizer,
-        lambda x: (1 - x / ((len(train_loader) // config.GRADIENT_ACCUMULATION_STEPS) * config.EPOCHS)) ** 0.9)
+        lambda x: (1 - x / total_steps) ** 0.9)
 
-    os.makedirs(config.CHECKPOINT_DIR, exist_ok=True)
-    best_oIoU = -1.0
+    best_oIoU  = -1.0
     start_time = time.time()
 
     for epoch in range(config.EPOCHS):
         train_one_epoch(model, optimizer, train_loader, lr_scheduler,
                         epoch, print_freq=10)
         mIoU, overall_IoU = evaluate(model, val_loader)
+
         if overall_IoU > best_oIoU:
             best_oIoU = overall_IoU
             save_path = os.path.join(config.CHECKPOINT_DIR, "model_best_camus.pth")
-            
-            # Save the raw un-wrapped state_dict to keep model loading cleanly universal
             torch.save({'model': raw_model.state_dict(), 'epoch': epoch}, save_path)
-            print("Saved new best model (Overall IoU {:.2f}) -> {}".format(
+            print("Saved best model (Overall IoU {:.2f}) -> {}".format(
                 overall_IoU, save_path), flush=True)
 
     total_time = str(datetime.timedelta(seconds=int(time.time() - start_time)))

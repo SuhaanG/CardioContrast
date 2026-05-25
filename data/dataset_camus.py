@@ -7,7 +7,6 @@ import torch.utils.data as data
 from PIL import Image
 from bert.tokenization_bert import BertTokenizer
 
-# Maps each CAMUS mask label to the text prompt describing it.
 STRUCTURE_PROMPTS = {
     1: "the left ventricle",
     2: "the myocardium",
@@ -18,7 +17,7 @@ class CAMUSDataset(data.Dataset):
     """
     Loads CAMUS image/mask pairs and produces one training example per
     structure per image (Option A). Returns the same 4-tuple format as
-    LAVT's ReferDataset so it plugs into LAVT's pipeline unchanged:
+    LAVT's ReferDataset:
         (img, target, tensor_embeddings, attention_mask)
     """
     def __init__(self, data_dir, bert_tokenizer="bert-base-uncased",
@@ -34,6 +33,11 @@ class CAMUSDataset(data.Dataset):
         mask_paths = glob.glob(
             os.path.join(self.data_dir, "patient*", "*_gt.nii.gz")
         )
+        # Sort for reproducibility: glob order varies by filesystem/OS.
+        # Without sorting, the seeded random_split produces different
+        # train/val splits on different machines.
+        mask_paths = sorted(mask_paths)
+
         for mask_path in mask_paths:
             if "half_sequence" in mask_path:
                 continue
@@ -43,9 +47,9 @@ class CAMUSDataset(data.Dataset):
             for label in STRUCTURE_PROMPTS.keys():
                 samples.append({
                     "image_path": image_path,
-                    "mask_path": mask_path,
-                    "label": label,
-                    "prompt": STRUCTURE_PROMPTS[label],
+                    "mask_path":  mask_path,
+                    "label":      label,
+                    "prompt":     STRUCTURE_PROMPTS[label],
                 })
         return samples
 
@@ -57,41 +61,36 @@ class CAMUSDataset(data.Dataset):
         return np.squeeze(arr)
 
     def _tokenize(self, sentence):
-        # Same tokenization scheme as LAVT's ReferDataset
-        attention_mask = [0] * self.max_tokens
+        attention_mask   = [0] * self.max_tokens
         padded_input_ids = [0] * self.max_tokens
         input_ids = self.tokenizer.encode(text=sentence, add_special_tokens=True)
         input_ids = input_ids[:self.max_tokens]
         padded_input_ids[:len(input_ids)] = input_ids
-        attention_mask[:len(input_ids)] = [1] * len(input_ids)
+        attention_mask[:len(input_ids)]   = [1] * len(input_ids)
         tensor_embeddings = torch.tensor(padded_input_ids).unsqueeze(0)
-        attention_mask = torch.tensor(attention_mask).unsqueeze(0)
+        attention_mask    = torch.tensor(attention_mask).unsqueeze(0)
         return tensor_embeddings, attention_mask
 
     def __getitem__(self, index):
         s = self.samples[index]
 
-        # --- Image: grayscale -> 3-channel RGB PIL image ---
         image = self._load_nifti_2d(s["image_path"]).astype(np.float32)
         if image.max() > 0:
             image = image / image.max() * 255.0
         image = image.astype(np.uint8)
         image = np.stack([image, image, image], axis=-1)
-        img = Image.fromarray(image).convert("RGB")
+        img   = Image.fromarray(image).convert("RGB")
 
-        # --- Mask: keep only THIS structure, as a P-mode PIL image (like LAVT) ---
         full_mask = self._load_nifti_2d(s["mask_path"])
-        annot = np.zeros(full_mask.shape)
+        annot     = np.zeros(full_mask.shape)
         annot[full_mask == s["label"]] = 1
         annot = Image.fromarray(annot.astype(np.uint8), mode="P")
 
-        # --- Apply LAVT's image transforms (resize, to-tensor, normalize) ---
         if self.image_transforms is not None:
             img, target = self.image_transforms(img, annot)
         else:
             target = annot
 
-        # --- Tokenize the prompt the same way LAVT does ---
         tensor_embeddings, attention_mask = self._tokenize(s["prompt"])
 
         return img, target, tensor_embeddings, attention_mask

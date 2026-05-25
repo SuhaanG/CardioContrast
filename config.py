@@ -1,61 +1,71 @@
 # config.py — all paths and hyperparameters in one place.
-# Tailored for the shared 2x RTX A4000 (24GB) workstation layout.
+# Mohammed: edit the PATHS section below to match the lab machine.
+# Nothing else needs to be edited to run training.
 
 import os
 import torch
 
 # =====================================================================
-# 1. PATHS & DIRECTORIES (SSD Storage-Aware)
+# 1. PATHS — EDIT THESE TO MATCH YOUR MACHINE
 # =====================================================================
-# Hardcoded to stream from local storage paths instead of caching to shared 128GB RAM
-CAMUS_DATA_DIR = "./data/CAMUS"            # Where CAMUS lives on your local SSD
-ECHONET_DATA_DIR = "./data/EchoNet"        # Prepped placeholder for your generalization dataset
-PRETRAINED_SWIN = "./pretrained_weights/swin_base_patch4_window12_384_22k.pth"
-CHECKPOINT_DIR = "./experiments/checkpoints"
-OUTPUT_DIR = "./experiments/outputs"
+# Set CAMUS_DATA_DIR to the full absolute path of your database_nifti folder.
+# Example: "/data/ssd/CAMUS_public/database_nifti"
+# DO NOT use a relative path like "./data/CAMUS" — it will not find the data.
+CAMUS_DATA_DIR = "/path/to/CAMUS_public/database_nifti"
+
+ECHONET_DATA_DIR = "/path/to/EchoNet"
+PRETRAINED_SWIN  = "./pretrained_weights/swin_base_patch4_window12_384_22k.pth"
+CHECKPOINT_DIR   = "./experiments/checkpoints"
+OUTPUT_DIR       = "./experiments/outputs"
+LOG_DIR          = "./logs"
 
 # =====================================================================
-# 2. COMPUTE CONFIGURATION (Dual-GPU Distribution Setup)
+# 2. COMPUTE CONFIGURATION
 # =====================================================================
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-# Explicitly handles multi-GPU tracking across your 2x A4000 setup
+DEVICE  = "cuda" if torch.cuda.is_available() else "cpu"
 GPU_IDS = [0, 1] if torch.cuda.device_count() > 1 else [0]
 
 # =====================================================================
-# 3. TRAINING & MEMORY-SAFE HYPERPARAMETERS (VRAM OOM Mitigation)
+# 3. TRAINING HYPERPARAMETERS
 # =====================================================================
-# Crucial Change: Setting the physical batch size to 8 on a 24GB A4000 with Swin-Base
-# at 480x480 resolution will trigger an instant OOM error.
-# We set physical BATCH_SIZE = 2 and use 4 GRADIENT_ACCUMULATION_STEPS.
-# Mathematical result: 2 (samples) * 4 (accumulations) = Effective Batch Size of 8.
-BATCH_SIZE = 2  
-GRADIENT_ACCUMULATION_STEPS = 4  
+# BATCH_SIZE = 2 with GRADIENT_ACCUMULATION_STEPS = 4 gives an
+# effective batch size of 8, safe for 24 GB A4000 cards.
+# If you still see an out-of-memory error, lower BATCH_SIZE to 1.
+BATCH_SIZE                  = 2
+GRADIENT_ACCUMULATION_STEPS = 4
 
-LR = 0.00005
+LR           = 0.00005
 WEIGHT_DECAY = 1e-2
-EPOCHS = 40
-IMG_SIZE = 480
-SWIN_TYPE = "base"
+EPOCHS       = 40
+IMG_SIZE     = 480
+SWIN_TYPE    = "base"
 
 # =====================================================================
-# 4. METHOD HYPERPARAMETERS (Core Algorithmic Ablation Switches)
+# 4. METHOD HYPERPARAMETERS
 # =====================================================================
-# 0.0 = contrastive loss OFF (baseline). >0.0 = ON. 
-# This serves as the switch your independent sweep scripts will toggle.
+# CONTRASTIVE_WEIGHT: 0.0 = baseline (contrastive loss OFF).
+# Set > 0.0 to enable CardioContrast contrastive loss (future experiment).
 CONTRASTIVE_WEIGHT = 0.0
-USE_MULTI_STAGE_ATTN = True  # Activates text-prompt injection at the decoder levels
+
+# USE_MULTI_STAGE_ATTN: future flag for decoder cross-attention.
+# Currently NOT active in the training script — do not change.
+USE_MULTI_STAGE_ATTN = False
 
 # =====================================================================
-# ENVIRONMENT INITIALIZER HOOK
+# ENVIRONMENT INITIALIZER — called automatically at training startup
 # =====================================================================
 def initialize_environment():
-    """Systematically builds directories so experiments do not conflict on the SSD."""
-    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    print(f"[*] Workspace Initialized on Device: {DEVICE}")
-    print(f"[*] Target GPUs: {GPU_IDS} | Available Memory Setup: 2x 24GB")
-    print(f"[*] Batch Execution Strategy: Physical Batch={BATCH_SIZE} | Accumulation Steps={GRADIENT_ACCUMULATION_STEPS}")
-    print(f"[*] Current Operational Architecture: Contrastive Weight Flag = {CONTRASTIVE_WEIGHT}")
+    for d in [CHECKPOINT_DIR, OUTPUT_DIR, LOG_DIR]:
+        os.makedirs(d, exist_ok=True)
+    print("[*] Device        : {}".format(DEVICE))
+    print("[*] GPUs           : {}".format(GPU_IDS))
+    print("[*] Batch size     : {} (physical) x {} (accumulation) = {} effective".format(
+        BATCH_SIZE, GRADIENT_ACCUMULATION_STEPS,
+        BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS))
+    print("[*] Contrastive    : {}".format(
+        "ON (weight={})".format(CONTRASTIVE_WEIGHT)
+        if CONTRASTIVE_WEIGHT > 0 else "OFF (baseline)"))
+    print("[*] CAMUS data dir : {}".format(CAMUS_DATA_DIR))
 
 if __name__ == "__main__":
     initialize_environment()
