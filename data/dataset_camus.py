@@ -3,8 +3,9 @@ import glob
 import numpy as np
 import nibabel as nib
 import torch
-from torch.utils.data import Dataset
+import torch.utils.data as data
 from PIL import Image
+from bert.tokenization_bert import BertTokenizer
 
 # Maps each CAMUS mask label to the text prompt describing it.
 STRUCTURE_PROMPTS = {
@@ -13,15 +14,19 @@ STRUCTURE_PROMPTS = {
     3: "the left atrium",
 }
 
-class CAMUSDataset(Dataset):
+class CAMUSDataset(data.Dataset):
     """
-    Loads CAMUS image/mask pairs and produces (image, prompt, binary_mask)
-    training examples — one per structure per image (Option A).
+    Loads CAMUS image/mask pairs and produces one training example per
+    structure per image (Option A). Returns the same 4-tuple format as
+    LAVT's ReferDataset so it plugs into LAVT's pipeline unchanged:
+        (img, target, tensor_embeddings, attention_mask)
     """
-    def __init__(self, data_dir, img_size=480, transform=None):
+    def __init__(self, data_dir, bert_tokenizer="bert-base-uncased",
+                 image_transforms=None, max_tokens=20):
         self.data_dir = data_dir
-        self.img_size = img_size
-        self.transform = transform
+        self.image_transforms = image_transforms
+        self.max_tokens = max_tokens
+        self.tokenizer = BertTokenizer.from_pretrained(bert_tokenizer)
         self.samples = self._build_index()
 
     def _build_index(self):
@@ -51,34 +56,42 @@ class CAMUSDataset(Dataset):
         arr = nib.load(path).get_fdata()
         return np.squeeze(arr)
 
-    def __getitem__(self, idx):
-        s = self.samples[idx]
+    def _tokenize(self, sentence):
+        # Same tokenization scheme as LAVT's ReferDataset
+        attention_mask = [0] * self.max_tokens
+        padded_input_ids = [0] * self.max_tokens
+        input_ids = self.tokenizer.encode(text=sentence, add_special_tokens=True)
+        input_ids = input_ids[:self.max_tokens]
+        padded_input_ids[:len(input_ids)] = input_ids
+        attention_mask[:len(input_ids)] = [1] * len(input_ids)
+        tensor_embeddings = torch.tensor(padded_input_ids).unsqueeze(0)
+        attention_mask = torch.tensor(attention_mask).unsqueeze(0)
+        return tensor_embeddings, attention_mask
 
+    def __getitem__(self, index):
+        s = self.samples[index]
+
+        # --- Image: grayscale -> 3-channel RGB PIL image ---
         image = self._load_nifti_2d(s["image_path"]).astype(np.float32)
         if image.max() > 0:
             image = image / image.max() * 255.0
         image = image.astype(np.uint8)
         image = np.stack([image, image, image], axis=-1)
-        image = Image.fromarray(image).resize(
-            (self.img_size, self.img_size), Image.BILINEAR
-        )
+        img = Image.fromarray(image).convert("RGB")
 
+        # --- Mask: keep only THIS structure, as a P-mode PIL image (like LAVT) ---
         full_mask = self._load_nifti_2d(s["mask_path"])
-        binary_mask = (full_mask == s["label"]).astype(np.uint8)
-        binary_mask = Image.fromarray(binary_mask * 255).resize(
-            (self.img_size, self.img_size), Image.NEAREST
-        )
-        binary_mask = (np.array(binary_mask) > 127).astype(np.float32)
+        annot = np.zeros(full_mask.shape)
+        annot[full_mask == s["label"]] = 1
+        annot = Image.fromarray(annot.astype(np.uint8), mode="P")
 
-        image = np.array(image)
+        # --- Apply LAVT's image transforms (resize, to-tensor, normalize) ---
+        if self.image_transforms is not None:
+            img, target = self.image_transforms(img, annot)
+        else:
+            target = annot
 
-        sample = {
-            "image": image,
-            "mask": binary_mask,
-            "prompt": s["prompt"],
-            "label": s["label"],
-            "image_path": s["image_path"],
-        }
-        if self.transform:
-            sample = self.transform(sample)
-        return sample
+        # --- Tokenize the prompt the same way LAVT does ---
+        tensor_embeddings, attention_mask = self._tokenize(s["prompt"])
+
+        return img, target, tensor_embeddings, attention_mask
