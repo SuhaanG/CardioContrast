@@ -2,7 +2,6 @@
 # Runs on 2x RTX A4000 (24GB) using gradient accumulation and DataParallel.
 #
 # Usage:
-#   mkdir -p logs
 #   python train_camus.py 2>&1 | tee logs/baseline_run.txt
 
 import os
@@ -21,6 +20,13 @@ import torch.utils.data
 from lib import segmentation
 import transforms as T
 import config
+
+
+def set_seed(seed):
+    """Seed all random sources for full reproducibility."""
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
 
 
 def build_model_args():
@@ -147,6 +153,8 @@ def evaluate(model, data_loader):
 
 def main():
     config.initialize_environment()
+    set_seed(config.SEED)
+
     assert torch.cuda.is_available(), "CUDA GPU required. Run on the lab machine."
 
     model_args = build_model_args()
@@ -166,12 +174,15 @@ def main():
             "points to the database_nifti folder containing patient* subfolders."
         )
 
+    # NOTE: this is a random 80/20 sample-level split seeded for reproducibility.
+    # TODO: replace with a patient-level split before reporting final paper results,
+    # to prevent the same patient appearing in both train and val (data leakage).
     n_total = len(full_dataset)
     n_val   = int(0.2 * n_total)
     n_train = n_total - n_val
     train_ds, val_ds = torch.utils.data.random_split(
         full_dataset, [n_train, n_val],
-        generator=torch.Generator().manual_seed(42))
+        generator=torch.Generator().manual_seed(config.SEED))
     print("Train: {}  Val: {}".format(n_train, n_val), flush=True)
 
     train_loader = torch.utils.data.DataLoader(

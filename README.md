@@ -27,18 +27,15 @@ git clone https://github.com/SuhaanG/CardioContrast.git
 cd CardioContrast
 
 ### 2. Set up the environment
-Use Python 3.9+. Install dependencies:
-pip install torch torchvision
-pip install nibabel numpy pillow
-pip install requests tqdm regex sacremoses sentencepiece filelock packaging tokenizers
-IMPORTANT: install a PyTorch build that matches the lab machine's CUDA
-version. Get the exact install command from https://pytorch.org (select your
-CUDA version). If you see CUDA errors at startup, it is a version mismatch
-— send the full error to Suhaan.
+First install PyTorch matching your CUDA version from https://pytorch.org.
+Then install remaining dependencies:
+pip install -r requirements.txt
+If you see CUDA errors at startup, it is a PyTorch/CUDA version mismatch.
+Send the full error to Suhaan.
 
 ### 3. Verify the GPUs are available
 python -c "import torch; print('CUDA available:', torch.cuda.is_available()); print('GPUs:', torch.cuda.device_count())"
-Must print "CUDA available: True" and "GPUs: 2". If False or 1, fix the
+Must print "CUDA available: True" and "GPUs: 2". If not, fix the
 PyTorch/CUDA install before continuing.
 
 ### 4. Download the CAMUS dataset
@@ -47,7 +44,7 @@ https://humanheart-project.creatis.insa-lyon.fr/database/#collection/6373703d73e
 
 Locate the database_nifti folder inside the download. It contains folders
 named patient0001, patient0002, etc. Note the FULL absolute path to this
-folder (e.g. /data/ssd/CAMUS_public/database_nifti). You will need it next.
+folder (e.g. /data/ssd/CAMUS_public/database_nifti). You need it in step 6.
 
 NOTE: the data loader reads files from disk on demand. It does NOT load
 the full dataset into RAM. Memory usage during training stays low.
@@ -57,19 +54,14 @@ mkdir -p pretrained_weights
 Download this exact file and place it inside pretrained_weights/:
 https://github.com/SwinTransformer/storage/releases/download/v1.0.0/swin_base_patch4_window12_384_22k.pth
 
----
-
-## Before Each Run: Edit config.py
-
+### 6. Edit config.py
 Open config.py and set CAMUS_DATA_DIR to the full absolute path of your
 database_nifti folder. This is the only line you need to change:
-
 ```python
 CAMUS_DATA_DIR = "/full/absolute/path/to/CAMUS_public/database_nifti"
 ```
-
 IMPORTANT: use a full absolute path, not a relative path like ./data/CAMUS.
-Leave all other settings as they are unless Suhaan tells you otherwise.
+Leave all other settings as they are unless Suhaan says otherwise.
 
 MEMORY NOTE: BATCH_SIZE = 2 with GRADIENT_ACCUMULATION_STEPS = 4 gives an
 effective batch size of 8, calibrated for 24GB A4000 cards. If you see an
@@ -80,7 +72,7 @@ out-of-memory error, lower BATCH_SIZE to 1 in config.py.
 ## Running Experiments
 
 Each experiment is a separate independent run. Run them one at a time at
-your convenience. There is no dependency between runs.
+your convenience — there is no dependency between runs.
 
 ### Step A: Create directories (do this once)
 mkdir -p logs experiments/checkpoints
@@ -89,7 +81,7 @@ mkdir -p logs experiments/checkpoints
 Temporarily set EPOCHS = 1 in config.py, then:
 python train_camus.py 2>&1 | tee logs/sanity_run.txt
 Confirm you see all of these in the output:
-- "[*] Device", "[*] GPUs", "[*] Batch size" lines from config startup
+- "[*] Device", "[*] GPUs", "[*] Effective batch" lines from startup
 - "Total CAMUS examples: 6000"
 - "Train: 4800  Val: 1200"
 - "Building model: lavt_one"
@@ -98,21 +90,21 @@ Confirm you see all of these in the output:
 
 Set EPOCHS back to 40 once confirmed.
 
+NOTE: if you see multiprocessing errors, set num_workers=0 in train_camus.py
+(line in the DataLoader calls) and retry.
+
 ### Step C: Full baseline run
 python train_camus.py 2>&1 | tee logs/baseline_run.txt
-This runs 40 epochs. The best checkpoint saves to:
+Runs 40 epochs. Best checkpoint saves to:
     experiments/checkpoints/model_best_camus.pth
 
 ### Future experiments
-Additional scripts will appear as the project progresses
-(e.g., train_camus_contrastive.py for the CardioContrast method).
+Additional scripts will appear as the project progresses.
 Suhaan will message you when a new script is ready to run.
 
 ---
 
 ## After Each Run: Send Back
-
-Please send Suhaan:
 - The log file (e.g. logs/baseline_run.txt)
 - The best checkpoint: experiments/checkpoints/model_best_camus.pth
   (large file — use Google Drive, NOT GitHub)
@@ -120,14 +112,11 @@ Please send Suhaan:
 ---
 
 ## Getting Updates
-
-Always pull before running a new experiment:
 git pull
 
 ---
 
 ## If Something Breaks
-
 Send Suhaan:
 - The COMPLETE error message (all of it, not just the last line)
 - Which step failed

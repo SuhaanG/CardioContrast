@@ -40,6 +40,10 @@ EPOCHS       = 40
 IMG_SIZE     = 480
 SWIN_TYPE    = "base"
 
+# Random seed — controls train/val split AND all model random ops.
+# Do NOT change this for any reported experiment.
+SEED = 42
+
 # =====================================================================
 # 4. METHOD HYPERPARAMETERS
 # =====================================================================
@@ -57,15 +61,15 @@ USE_MULTI_STAGE_ATTN = False
 def initialize_environment():
     for d in [CHECKPOINT_DIR, OUTPUT_DIR, LOG_DIR]:
         os.makedirs(d, exist_ok=True)
-    print("[*] Device        : {}".format(DEVICE))
-    print("[*] GPUs           : {}".format(GPU_IDS))
-    print("[*] Batch size     : {} (physical) x {} (accumulation) = {} effective".format(
+    print("[*] Device         : {}".format(DEVICE))
+    print("[*] GPUs            : {}".format(GPU_IDS))
+    print("[*] Effective batch : {} physical x {} accumulation = {}".format(
         BATCH_SIZE, GRADIENT_ACCUMULATION_STEPS,
         BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS))
-    print("[*] Contrastive    : {}".format(
+    print("[*] Contrastive     : {}".format(
         "ON (weight={})".format(CONTRASTIVE_WEIGHT)
         if CONTRASTIVE_WEIGHT > 0 else "OFF (baseline)"))
-    print("[*] CAMUS data dir : {}".format(CAMUS_DATA_DIR))
+    print("[*] CAMUS data dir  : {}".format(CAMUS_DATA_DIR))
 
 if __name__ == "__main__":
     initialize_environment()
