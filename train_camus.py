@@ -1,13 +1,5 @@
-"""
-train_camus.py — Single-GPU training of LAVT on the CAMUS dataset.
-
-Clean single-GPU adaptation of LAVT's train.py. Reuses LAVT's model, loss,
-and training-loop logic; removes the multi-GPU DistributedDataParallel
-machinery so it runs on one A6000. LAVT's original train.py is left untouched.
-
-All settings come from config.py. Run on the A6000 machine:
-    python train_camus.py
-"""
+# train_camus.py — Multi-GPU memory-optimized training of LAVT on the CAMUS dataset.
+# Adapted to run on 2x RTX A4000 (24GB) using Gradient Accumulation and DataParallel.
 
 import os
 import time
@@ -49,7 +41,8 @@ def get_transform(img_size):
 
 
 def criterion(output, target):
-    weight = torch.FloatTensor([0.9, 1.1]).cuda()
+    # Sends loss weighting array to current active device
+    weight = torch.FloatTensor([0.9, 1.1]).to(output.device)
     return nn.functional.cross_entropy(output, target, weight=weight)
 
 
@@ -66,6 +59,10 @@ def train_one_epoch(model, optimizer, data_loader, lr_scheduler, epoch, print_fr
     model.train()
     running_loss = 0.0
     n_batches = 0
+    
+    # Reset gradients explicitly at start of epoch loop
+    optimizer.zero_grad()
+    
     for i, data in enumerate(data_loader):
         image, target, sentences, attentions = data
         image = image.cuda(non_blocking=True)
@@ -76,23 +73,36 @@ def train_one_epoch(model, optimizer, data_loader, lr_scheduler, epoch, print_fr
         sentences = sentences.squeeze(1)
         attentions = attentions.squeeze(1)
 
+        # Multi-GPU DataParallel splits batches along dim 0 here automatically
         output = model(image, sentences, l_mask=attentions)
 
+        # 1. Base Segmentation Cross-Entropy
         loss = criterion(output, target)
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-        lr_scheduler.step()
+        
+        # TODO: Add your multi-stage decoder activations contrastive loss here later.
+        # total_loss = loss + (config.CONTRASTIVE_WEIGHT * loss_contrastive)
+        total_loss = loss
+        
+        # 2. Gradient Accumulation Scaling
+        # Scales loss downward by accumulation factor to balance small physical steps
+        scaled_loss = total_loss / config.GRADIENT_ACCUMULATION_STEPS
+        scaled_loss.backward()
 
-        running_loss += loss.item()
+        # 3. Step Optimizer only when accumulation step window matches target steps
+        if (i + 1) % config.GRADIENT_ACCUMULATION_STEPS == 0 or (i + 1) == len(data_loader):
+            optimizer.step()
+            lr_scheduler.step()
+            optimizer.zero_grad() # Flush out accumulated tracking gradients cleanly
+
+        running_loss += total_loss.item()
         n_batches += 1
 
         if i % print_freq == 0:
             print("Epoch [{}] step [{}/{}] loss {:.4f} lr {:.6f}".format(
-                epoch, i, len(data_loader), loss.item(),
+                epoch, i, len(data_loader), total_loss.item(),
                 optimizer.param_groups[0]['lr']), flush=True)
 
-        del image, target, sentences, attentions, loss, output, data
+        del image, target, sentences, attentions, loss, total_loss, scaled_loss, output, data
         gc.collect()
         torch.cuda.empty_cache()
 
@@ -141,7 +151,7 @@ def evaluate(model, data_loader):
 
 
 def main():
-    assert torch.cuda.is_available(), "CUDA GPU required (run on the A6000 machine)."
+    assert torch.cuda.is_available(), "CUDA GPU required."
 
     model_args = build_model_args()
     transform = get_transform(config.IMG_SIZE)
@@ -171,11 +181,22 @@ def main():
     print("Building model: {}".format(model_args.model), flush=True)
     model = segmentation.__dict__[model_args.model](
         pretrained=config.PRETRAINED_SWIN, args=model_args)
+    
+    # Enforces distribution across your workstation's dual devices
+    if len(config.GPU_IDS) > 1:
+        print(f"[+] Activating DataParallel execution on GPUs: {config.GPU_IDS}")
+        model = nn.DataParallel(model, device_ids=config.GPU_IDS)
+    
     model.cuda()
 
+    # Param sorting structure adjusted for DataParallel wrapped setups
     backbone_no_decay = []
     backbone_decay = []
-    for name, m in model.backbone.named_parameters():
+    
+    # Access inner model attribute to extract parameters correctly if wrapped in DataParallel
+    raw_model = model.module if isinstance(model, nn.DataParallel) else model
+    
+    for name, m in raw_model.backbone.named_parameters():
         if 'norm' in name or 'absolute_pos_embed' in name or 'relative_position_bias_table' in name:
             backbone_no_decay.append(m)
         else:
@@ -184,18 +205,19 @@ def main():
     params_to_optimize = [
         {'params': backbone_no_decay, 'weight_decay': 0.0},
         {'params': backbone_decay},
-        {"params": [p for p in model.classifier.parameters() if p.requires_grad]},
+        {"params": [p for p in raw_model.classifier.parameters() if p.requires_grad]},
         {"params": reduce(operator.concat,
-                          [[p for p in model.text_encoder.encoder.layer[i].parameters()
+                          [[p for p in raw_model.text_encoder.encoder.layer[i].parameters()
                             if p.requires_grad] for i in range(10)])},
     ]
 
     optimizer = torch.optim.AdamW(
         params_to_optimize, lr=config.LR, weight_decay=config.WEIGHT_DECAY)
 
+    # Scale the learning rate lambda adjustment to account for gradient accumulation updates
     lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
         optimizer,
-        lambda x: (1 - x / (len(train_loader) * config.EPOCHS)) ** 0.9)
+        lambda x: (1 - x / ((len(train_loader) // config.GRADIENT_ACCUMULATION_STEPS) * config.EPOCHS)) ** 0.9)
 
     os.makedirs(config.CHECKPOINT_DIR, exist_ok=True)
     best_oIoU = -1.0
@@ -208,7 +230,9 @@ def main():
         if overall_IoU > best_oIoU:
             best_oIoU = overall_IoU
             save_path = os.path.join(config.CHECKPOINT_DIR, "model_best_camus.pth")
-            torch.save({'model': model.state_dict(), 'epoch': epoch}, save_path)
+            
+            # Save the raw un-wrapped state_dict to keep model loading cleanly universal
+            torch.save({'model': raw_model.state_dict(), 'epoch': epoch}, save_path)
             print("Saved new best model (Overall IoU {:.2f}) -> {}".format(
                 overall_IoU, save_path), flush=True)
 
