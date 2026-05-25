@@ -1,0 +1,16 @@
+# Data — never in git
+data/CAMUS/
+data/EchoNet/
+*.nii
+*.nii.gz
+
+# Weights / checkpoints — too big for git
+*.pth
+checkpoints/
+pretrained_weights/
+models/
+
+# Python junk
+__pycache__/
+*.pyc
+.DS_Store
