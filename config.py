@@ -73,3 +73,7 @@ def initialize_environment():
 
 if __name__ == "__main__":
     initialize_environment()
+
+# Contrastive loss temperature (tau). Fixed at 0.07 following SimCLR.
+# Ablate this if reviewers ask about sensitivity.
+CONTRASTIVE_TAU = 0.07

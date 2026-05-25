@@ -21,11 +21,9 @@ import torch.utils.data
 
 from lib import segmentation
 from lib.contrastive import ContrastiveAnatomicalLoss
+from data.samplers import GroupedStructureSampler
 import transforms as T
 import config
-
-# Swin-Base decoder hidden_size = c4_dims // 2 = 1024 // 2 = 512
-DECODER_HIDDEN_SIZE = 512
 
 
 def set_seed(seed):
@@ -42,6 +40,19 @@ def build_model_args():
         bert_tokenizer="bert-base-uncased",
         ck_bert="bert-base-uncased",
     )
+
+
+def get_decoder_hidden_size(swin_type):
+    """
+    Derive decoder hidden_size from the Swin backbone type.
+    SimpleDecoding sets hidden_size = c4_dims // 2.
+    Swin c4_dims = embed_dim * 8.
+    embed_dim: tiny/small=96, base=128, large=192.
+    """
+    embed_dims = {"tiny": 96, "small": 96, "base": 128, "large": 192}
+    embed_dim  = embed_dims.get(swin_type, 128)
+    c4_dims    = embed_dim * 8
+    return c4_dims // 2
 
 
 def get_transform(img_size):
@@ -72,6 +83,7 @@ def train_one_epoch(model, contrastive_module, optimizer, data_loader,
     contrastive_module.train()
     running_loss_seg = running_loss_cont = 0.0
     n_batches = 0
+    n_contrastive_fired = 0
     optimizer.zero_grad()
 
     for i, data in enumerate(data_loader):
@@ -91,6 +103,11 @@ def train_one_epoch(model, contrastive_module, optimizer, data_loader,
         loss_seg  = criterion(logits, target)
         loss_cont = contrastive_module(
             pre_logit_features, logits, image_ids, structure_ids)
+
+        # Track how often contrastive loss actually fires (diagnostic)
+        if loss_cont.item() > 0:
+            n_contrastive_fired += 1
+
         total_loss  = loss_seg + config.CONTRASTIVE_WEIGHT * loss_cont
         scaled_loss = total_loss / config.GRADIENT_ACCUMULATION_STEPS
         scaled_loss.backward()
@@ -116,10 +133,12 @@ def train_one_epoch(model, contrastive_module, optimizer, data_loader,
         gc.collect()
         torch.cuda.empty_cache()
 
-    print("Epoch [{}] avg seg {:.4f} avg cont {:.4f}".format(
+    pct_fired = 100.0 * n_contrastive_fired / max(1, n_batches)
+    print("Epoch [{}] avg seg {:.4f} avg cont {:.4f} contrastive fired {:.1f}% of steps".format(
         epoch,
         running_loss_seg  / max(1, n_batches),
-        running_loss_cont / max(1, n_batches)), flush=True)
+        running_loss_cont / max(1, n_batches),
+        pct_fired), flush=True)
 
 
 def evaluate(model, data_loader):
@@ -144,7 +163,8 @@ def evaluate(model, data_loader):
             iou, I, U  = IoU(output, target)
             acc_ious  += iou
             mean_IoU.append(iou)
-            cum_I += I; cum_U += U
+            cum_I += I
+            cum_U += U
             for n in range(len(eval_seg_iou_list)):
                 seg_correct[n] += (iou >= eval_seg_iou_list[n])
 
@@ -162,8 +182,10 @@ def main():
     assert config.CONTRASTIVE_WEIGHT > 0.0, (
         "Set CONTRASTIVE_WEIGHT > 0.0 in config.py before running this script.")
 
-    model_args = build_model_args()
-    transform  = get_transform(config.IMG_SIZE)
+    model_args          = build_model_args()
+    transform           = get_transform(config.IMG_SIZE)
+    decoder_hidden_size = get_decoder_hidden_size(config.SWIN_TYPE)
+    print("Decoder hidden size: {}".format(decoder_hidden_size), flush=True)
 
     from data.dataset_camus_contrastive import CAMUSDatasetContrastive
     full_dataset = CAMUSDatasetContrastive(
@@ -183,8 +205,14 @@ def main():
         generator=torch.Generator().manual_seed(config.SEED))
     print("Train: {}  Val: {}".format(n_train, n_val), flush=True)
 
+    # Use GroupedStructureSampler to guarantee same-image pairs in every batch.
+    # This is critical for the contrastive loss to fire reliably.
+    train_sampler = GroupedStructureSampler(
+        train_ds.dataset, batch_size=config.BATCH_SIZE, shuffle=True)
     train_loader = torch.utils.data.DataLoader(
-        train_ds, batch_size=config.BATCH_SIZE, shuffle=True,
+        train_ds, batch_sampler=None,
+        batch_size=config.BATCH_SIZE,
+        sampler=train_sampler,
         num_workers=4, pin_memory=True, drop_last=True)
     val_loader = torch.utils.data.DataLoader(
         val_ds, batch_size=1, shuffle=False, num_workers=4)
@@ -193,13 +221,14 @@ def main():
         pretrained=config.PRETRAINED_SWIN, args=model_args)
 
     contrastive_module = ContrastiveAnatomicalLoss(
-        in_dim=DECODER_HIDDEN_SIZE,
-        proj_hidden_dim=DECODER_HIDDEN_SIZE,
+        in_dim=decoder_hidden_size,
+        proj_hidden_dim=decoder_hidden_size,
         proj_out_dim=128,
-        tau=0.07,
+        tau=config.CONTRASTIVE_TAU,
     )
 
     if len(config.GPU_IDS) > 1:
+        print("Activating DataParallel on GPUs: {}".format(config.GPU_IDS))
         model = nn.DataParallel(model, device_ids=config.GPU_IDS)
 
     model.cuda()
@@ -233,7 +262,8 @@ def main():
 
     best_oIoU  = -1.0
     start_time = time.time()
-    print("Contrastive weight: {}".format(config.CONTRASTIVE_WEIGHT), flush=True)
+    print("Contrastive weight: {}  tau: {}".format(
+        config.CONTRASTIVE_WEIGHT, config.CONTRASTIVE_TAU), flush=True)
 
     for epoch in range(config.EPOCHS):
         train_one_epoch(model, contrastive_module, optimizer,
@@ -249,6 +279,7 @@ def main():
                 'contrastive_module': contrastive_module.state_dict(),
                 'epoch':              epoch,
                 'contrastive_weight': config.CONTRASTIVE_WEIGHT,
+                'tau':                config.CONTRASTIVE_TAU,
             }, save_path)
             print("Saved best model (Overall IoU {:.2f}) -> {}".format(
                 overall_IoU, save_path), flush=True)
