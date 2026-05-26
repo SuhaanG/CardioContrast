@@ -2,17 +2,13 @@
 
 Language-guided echocardiographic segmentation. Two contributions over the
 LAVT baseline:
-  1. Multi-stage decoder cross-attention — language injected at every decoder
+  1. Multi-stage decoder cross-attention - language injected at every decoder
      refinement stage, not just the encoder.
   2. Contrastive anatomical repulsion loss — penalizes similar decoder
      activations when different structure prompts are applied to the same image.
 
 Training on CAMUS (3 cardiac structures). Generalization test on EchoNet-Dynamic.
 Single-node dual-GPU: 2x RTX A4000 (24GB each).
-
-This README is written for Mohammed, who runs the experiments on the lab
-machine. Suhaan writes all the code and pushes updates. Mohammed pulls
-and runs at his convenience, interleaved with his own work.
 
 ---
 
