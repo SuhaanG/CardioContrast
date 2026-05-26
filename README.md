@@ -4,11 +4,6 @@ Language-guided echocardiographic segmentation built on LAVT, trained on
 the CAMUS cardiac ultrasound dataset. Single-node dual-GPU training on
 2x RTX A4000 (24GB each).
 
-This README is written for Mohammed, who runs the experiments on the lab
-machine. Suhaan (the author) writes all the code and pushes updates to
-GitHub. Mohammed pulls updates and runs training at his convenience,
-interleaved with his own experiments.
-
 ---
 
 ## Overview
