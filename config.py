@@ -47,17 +47,32 @@ SEED = 42
 # =====================================================================
 # 4. METHOD HYPERPARAMETERS
 # =====================================================================
-# CONTRASTIVE_WEIGHT: 0.0 = baseline (contrastive loss OFF).
-# Set > 0.0 to run the CardioContrast method (e.g. 0.1).
+# CONTRASTIVE_WEIGHT controls the ablation:
+#
+#   Experiment 1 — Baseline (LAVT, no contributions):
+#     Use train_camus.py with CONTRASTIVE_WEIGHT = 0.0 (default)
+#
+#   Experiment 2 — Decoder cross-attention only (Contribution 1):
+#     Use train_camus_contrastive.py with CONTRASTIVE_WEIGHT = 0.0
+#
+#   Experiment 3 — Full CardioContrast (both contributions):
+#     Use train_camus_contrastive.py with CONTRASTIVE_WEIGHT = 0.1
+#
+# Comparing Exp 1 vs 2 isolates the decoder cross-attention contribution.
+# Comparing Exp 2 vs 3 isolates the contrastive loss contribution.
+# Comparing Exp 1 vs 3 shows the full combined improvement.
 CONTRASTIVE_WEIGHT = 0.0
 
 # CONTRASTIVE_TAU: temperature for the contrastive repulsion loss.
 # Fixed at 0.07 following SimCLR. Ablate if reviewers ask about sensitivity.
 CONTRASTIVE_TAU = 0.07
 
-# USE_MULTI_STAGE_ATTN: placeholder for future decoder cross-attention flag.
-# Currently NOT active in any training script — do not change.
-USE_MULTI_STAGE_ATTN = False
+# USE_MULTI_STAGE_ATTN: decoder cross-attention is now IMPLEMENTED.
+# This flag documents the state of the method — do not change it manually.
+# Controlled by which script you run:
+#   train_camus.py             -> decode_with_lang=False (baseline, CA inactive)
+#   train_camus_contrastive.py -> decode_with_lang=True  (CardioContrast, CA active)
+USE_MULTI_STAGE_ATTN = True
 
 # =====================================================================
 # ENVIRONMENT INITIALIZER — called automatically at training startup
@@ -72,7 +87,7 @@ def initialize_environment():
         BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS))
     print("[*] Contrastive     : {}".format(
         "ON (weight={}, tau={})".format(CONTRASTIVE_WEIGHT, CONTRASTIVE_TAU)
-        if CONTRASTIVE_WEIGHT > 0 else "OFF (baseline)"))
+        if CONTRASTIVE_WEIGHT > 0 else "OFF (baseline or decoder-CA-only)"))
     print("[*] CAMUS data dir  : {}".format(CAMUS_DATA_DIR))
 
 if __name__ == "__main__":
