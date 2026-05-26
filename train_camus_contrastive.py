@@ -3,6 +3,10 @@
 #
 # Before running: set CONTRASTIVE_WEIGHT > 0.0 in config.py (e.g. 0.1)
 #
+# CardioContrast adds two contributions over the LAVT baseline:
+#   1. Multi-stage decoder cross-attention (decode_with_lang=True)
+#   2. Contrastive anatomical repulsion loss
+#
 # Usage:
 #   python train_camus_contrastive.py 2>&1 | tee logs/contrastive_run.txt
 
@@ -43,12 +47,6 @@ def build_model_args():
 
 
 def get_decoder_hidden_size(swin_type):
-    """
-    Derive decoder hidden_size from the Swin backbone type.
-    SimpleDecoding sets hidden_size = c4_dims // 2.
-    Swin c4_dims = embed_dim * 8.
-    embed_dim: tiny/small=96, base=128, large=192.
-    """
     embed_dims = {"tiny": 96, "small": 96, "base": 128, "large": 192}
     embed_dim  = embed_dims.get(swin_type, 128)
     c4_dims    = embed_dim * 8
@@ -97,10 +95,14 @@ def train_one_epoch(model, contrastive_module, optimizer, data_loader,
         sentences     = sentences.squeeze(1)
         attentions    = attentions.squeeze(1)
 
+        # decode_with_lang=True: activates multi-stage decoder cross-attention.
+        # This is Contribution 1 of CardioContrast.
         logits, pre_logit_features = model(
-            image, sentences, l_mask=attentions, return_features=True)
+            image, sentences, l_mask=attentions,
+            return_features=True, decode_with_lang=True)
 
         loss_seg  = criterion(logits, target)
+        # Contribution 2: contrastive anatomical repulsion loss
         loss_cont = contrastive_module(
             pre_logit_features, logits, image_ids, structure_ids)
 
@@ -133,7 +135,7 @@ def train_one_epoch(model, contrastive_module, optimizer, data_loader,
         torch.cuda.empty_cache()
 
     pct_fired = 100.0 * n_contrastive_fired / max(1, n_batches)
-    print("Epoch [{}] avg seg {:.4f} avg cont {:.4f} contrastive fired {:.1f}% of steps".format(
+    print("Epoch [{}] avg seg {:.4f} avg cont {:.4f} contrastive fired {:.1f}%".format(
         epoch,
         running_loss_seg  / max(1, n_batches),
         running_loss_cont / max(1, n_batches),
@@ -158,7 +160,9 @@ def evaluate(model, data_loader):
             attentions = attentions.cuda(non_blocking=True)
             sentences  = sentences.squeeze(1)
             attentions = attentions.squeeze(1)
-            output     = model(image, sentences, l_mask=attentions)
+            # Use decode_with_lang=True at eval (CardioContrast mode)
+            output     = model(image, sentences, l_mask=attentions,
+                               decode_with_lang=True)
             iou, I, U  = IoU(output, target)
             acc_ious  += iou
             mean_IoU.append(iou)
@@ -204,9 +208,6 @@ def main():
         generator=torch.Generator().manual_seed(config.SEED))
     print("Train: {}  Val: {}".format(n_train, n_val), flush=True)
 
-    # GroupedStructureSampler guarantees same-image pairs in every batch.
-    # Pass train_ds.indices (split indices only) NOT train_ds.dataset
-    # (full dataset) to prevent sampling validation examples during training.
     train_sampler = GroupedStructureSampler(
         dataset=train_ds.dataset,
         train_indices=train_ds.indices,
