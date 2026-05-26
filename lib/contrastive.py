@@ -3,20 +3,18 @@ lib/contrastive.py — Contrastive Anatomical Differentiation loss for CardioCon
 
 Implements a contrastive anatomical repulsion loss that enforces representationally
 distinct decoder activations for different anatomical structures prompted on the
-same image. This is the core technical contribution of CardioContrast.
+same image. This is the core of Contribution 2 of CardioContrast.
 
 NOTE ON LOSS FORMULATION:
 This is an anatomical repulsion loss, not standard InfoNCE. Standard InfoNCE
 requires explicit positives (two augmented views of the same instance). Our
-formulation has no explicit positives — it pushes different anatomical structures
-apart for the same image. This is the correct formulation for our task: we want
-the decoder to produce separable representations for "left ventricle" vs
-"myocardium" vs "left atrium" on the same image. The math is equivalent to the
-denominator term of InfoNCE with the numerator treated as a constant
-(self-similarity = 1/tau). Refer to this as "contrastive anatomical repulsion
-loss" in the paper, not InfoNCE.
+formulation has no explicit positives: it pushes different anatomical structures
+apart for the same image. This is the correct formulation for our task — we want
+the decoder to produce separable representations for the left ventricle vs
+myocardium vs left atrium on the same image. Refer to this as the
+"contrastive anatomical repulsion loss" in the paper, not InfoNCE.
 
-Design decisions (all grounded in the paper claims):
+Design decisions:
 1. Hook point: decoder pre-logit features (B, C, H, W) before conv1_1.
 2. Masked average pooling over predicted structure region (not diluted by background).
 3. 2-layer MLP projection head following SimCLR best practice.
@@ -31,9 +29,9 @@ import torch.nn.functional as F
 class ProjectionHead(nn.Module):
     """
     2-layer MLP projection head following SimCLR.
-    Projects pooled decoder features into a contrastive embedding space.
-    Keeping this separate from the segmentation head means contrastive
-    optimization does not distort the segmentation features.
+    Projects pooled decoder features into a dedicated contrastive embedding space.
+    Separate from the segmentation head so contrastive optimization does not
+    distort the features used for mask prediction.
     """
     def __init__(self, in_dim, hidden_dim=None, out_dim=128):
         super().__init__()
@@ -53,13 +51,12 @@ class ProjectionHead(nn.Module):
 def masked_average_pool(features, mask_logits):
     """
     Pool decoder feature map weighted by predicted structure probability.
-    Uses the foreground channel as the pooling weight so background pixels
+    Uses only the foreground channel as the pooling weight so background pixels
     do not dilute the structure-specific representation.
 
     Args:
         features:    (B, C, H, W) pre-logit decoder spatial features
         mask_logits: (B, 2, H, W) decoder output logits (background, foreground)
-
     Returns:
         pooled: (B, C) structure-specific feature vector
     """
@@ -80,8 +77,8 @@ def anatomical_repulsion_loss(embeddings, image_ids, structure_ids, tau=0.07):
 
     For each anchor (image_i, structure_a), negatives are all samples
     (image_i, structure_b) where b != a. This makes the loss non-redundant
-    with supervised segmentation: the supervised loss treats each prompt as
-    independent; this loss explicitly penalizes similar representations when
+    with supervised segmentation: the supervised loss treats each prompt
+    independently; this loss explicitly penalizes similar representations when
     the prompt changes on the same image.
 
     Args:
@@ -89,9 +86,8 @@ def anatomical_repulsion_loss(embeddings, image_ids, structure_ids, tau=0.07):
         image_ids:     (B,)  integer source image ID per sample
         structure_ids: (B,)  structure label (1, 2, 3) per sample
         tau:           float temperature
-
     Returns:
-        scalar loss
+        scalar loss (0.0 if no same-image pairs exist in batch)
     """
     B      = embeddings.size(0)
     device = embeddings.device
@@ -124,7 +120,7 @@ class ContrastiveAnatomicalLoss(nn.Module):
     Full contrastive anatomical differentiation loss module.
     Combines masked average pooling, projection head, and repulsion loss.
 
-    Usage:
+    Usage in training loop:
         module = ContrastiveAnatomicalLoss(in_dim=512)
         loss = module(features, logits, image_ids, structure_ids)
         total_loss = loss_seg + config.CONTRASTIVE_WEIGHT * loss

@@ -1,14 +1,17 @@
 # train_camus_contrastive.py — CardioContrast full method training.
-# Run AFTER confirming train_camus.py (baseline) works correctly.
+# Run AFTER confirming train_camus.py (baseline, Experiment 1) works.
 #
-# Before running: set CONTRASTIVE_WEIGHT > 0.0 in config.py (e.g. 0.1)
-#
-# CardioContrast adds two contributions over the LAVT baseline:
+# This script implements BOTH CardioContrast contributions:
 #   1. Multi-stage decoder cross-attention (decode_with_lang=True)
-#   2. Contrastive anatomical repulsion loss
+#   2. Contrastive anatomical repulsion loss (CONTRASTIVE_WEIGHT > 0)
+#
+# Ablation control via config.py:
+#   CONTRASTIVE_WEIGHT=0.0 -> Experiment 2 (decoder CA only, no contrastive)
+#   CONTRASTIVE_WEIGHT=0.1 -> Experiment 3 (full CardioContrast)
 #
 # Usage:
-#   python train_camus_contrastive.py 2>&1 | tee logs/contrastive_run.txt
+#   python train_camus_contrastive.py 2>&1 | tee logs/exp2_decoder_ca.txt
+#   python train_camus_contrastive.py 2>&1 | tee logs/exp3_cardiocontrast.txt
 
 import os
 import time
@@ -47,10 +50,15 @@ def build_model_args():
 
 
 def get_decoder_hidden_size(swin_type):
+    """
+    Derive decoder hidden_size from Swin backbone type.
+    SimpleDecoding: hidden_size = c4_dims // 2.
+    Swin c4_dims = embed_dim * 8.
+    embed_dim: tiny/small=96, base=128, large=192.
+    """
     embed_dims = {"tiny": 96, "small": 96, "base": 128, "large": 192}
     embed_dim  = embed_dims.get(swin_type, 128)
-    c4_dims    = embed_dim * 8
-    return c4_dims // 2
+    return (embed_dim * 8) // 2
 
 
 def get_transform(img_size):
@@ -95,14 +103,18 @@ def train_one_epoch(model, contrastive_module, optimizer, data_loader,
         sentences     = sentences.squeeze(1)
         attentions    = attentions.squeeze(1)
 
-        # decode_with_lang=True: activates multi-stage decoder cross-attention.
-        # This is Contribution 1 of CardioContrast.
+        # Contribution 1: decode_with_lang=True activates multi-stage
+        # decoder cross-attention at all three refinement stages.
         logits, pre_logit_features = model(
             image, sentences, l_mask=attentions,
             return_features=True, decode_with_lang=True)
 
-        loss_seg  = criterion(logits, target)
-        # Contribution 2: contrastive anatomical repulsion loss
+        # Segmentation loss (always active)
+        loss_seg = criterion(logits, target)
+
+        # Contribution 2: contrastive anatomical repulsion loss.
+        # Active when CONTRASTIVE_WEIGHT > 0 in config.py.
+        # Returns 0.0 when weight=0 (Experiment 2 mode).
         loss_cont = contrastive_module(
             pre_logit_features, logits, image_ids, structure_ids)
 
@@ -160,10 +172,10 @@ def evaluate(model, data_loader):
             attentions = attentions.cuda(non_blocking=True)
             sentences  = sentences.squeeze(1)
             attentions = attentions.squeeze(1)
-            # Use decode_with_lang=True at eval (CardioContrast mode)
-            output     = model(image, sentences, l_mask=attentions,
-                               decode_with_lang=True)
-            iou, I, U  = IoU(output, target)
+            # Evaluation: use decode_with_lang=True (CardioContrast inference mode)
+            output = model(image, sentences, l_mask=attentions,
+                           decode_with_lang=True)
+            iou, I, U = IoU(output, target)
             acc_ious  += iou
             mean_IoU.append(iou)
             cum_I += I
@@ -181,14 +193,21 @@ def evaluate(model, data_loader):
 def main():
     config.initialize_environment()
     set_seed(config.SEED)
-    assert torch.cuda.is_available(), "CUDA GPU required."
-    assert config.CONTRASTIVE_WEIGHT > 0.0, (
-        "Set CONTRASTIVE_WEIGHT > 0.0 in config.py before running this script.")
+    assert torch.cuda.is_available(), "CUDA GPU required. Run on the lab machine."
+    assert config.CONTRASTIVE_WEIGHT >= 0.0, "CONTRASTIVE_WEIGHT must be >= 0.0"
 
     model_args          = build_model_args()
     transform           = get_transform(config.IMG_SIZE)
     decoder_hidden_size = get_decoder_hidden_size(config.SWIN_TYPE)
     print("Decoder hidden size: {}".format(decoder_hidden_size), flush=True)
+    print("Contrastive weight: {}  tau: {}".format(
+        config.CONTRASTIVE_WEIGHT, config.CONTRASTIVE_TAU), flush=True)
+    if config.CONTRASTIVE_WEIGHT == 0.0:
+        print("Mode: Experiment 2 — decoder cross-attention only, no contrastive loss",
+              flush=True)
+    else:
+        print("Mode: Experiment 3 — full CardioContrast (decoder CA + contrastive loss)",
+              flush=True)
 
     from data.dataset_camus_contrastive import CAMUSDatasetContrastive
     full_dataset = CAMUSDatasetContrastive(
@@ -198,8 +217,12 @@ def main():
     )
     print("Total CAMUS examples: {}".format(len(full_dataset)), flush=True)
     if len(full_dataset) == 0:
-        raise ValueError("No CAMUS samples found. Check CAMUS_DATA_DIR in config.py.")
+        raise ValueError(
+            "No CAMUS samples found. Check that CAMUS_DATA_DIR in config.py "
+            "points to the database_nifti folder containing patient* subfolders.")
 
+    # NOTE: random 80/20 split seeded for reproducibility.
+    # TODO: replace with patient-level split before reporting final paper results.
     n_total = len(full_dataset)
     n_val   = int(0.2 * n_total)
     n_train = n_total - n_val
@@ -208,6 +231,9 @@ def main():
         generator=torch.Generator().manual_seed(config.SEED))
     print("Train: {}  Val: {}".format(n_train, n_val), flush=True)
 
+    # GroupedStructureSampler guarantees same-image pairs in every batch.
+    # IMPORTANT: pass train_ds.indices (split indices only), NOT train_ds.dataset
+    # (full dataset), to prevent sampling validation examples during training.
     train_sampler = GroupedStructureSampler(
         dataset=train_ds.dataset,
         train_indices=train_ds.indices,
@@ -221,6 +247,7 @@ def main():
     val_loader = torch.utils.data.DataLoader(
         val_ds, batch_size=1, shuffle=False, num_workers=4)
 
+    print("Building model: {}".format(model_args.model), flush=True)
     model = segmentation.__dict__[model_args.model](
         pretrained=config.PRETRAINED_SWIN, args=model_args)
 
@@ -266,8 +293,6 @@ def main():
 
     best_oIoU  = -1.0
     start_time = time.time()
-    print("Contrastive weight: {}  tau: {}".format(
-        config.CONTRASTIVE_WEIGHT, config.CONTRASTIVE_TAU), flush=True)
 
     for epoch in range(config.EPOCHS):
         train_one_epoch(model, contrastive_module, optimizer,
