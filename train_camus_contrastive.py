@@ -104,7 +104,6 @@ def train_one_epoch(model, contrastive_module, optimizer, data_loader,
         loss_cont = contrastive_module(
             pre_logit_features, logits, image_ids, structure_ids)
 
-        # Track how often contrastive loss actually fires (diagnostic)
         if loss_cont.item() > 0:
             n_contrastive_fired += 1
 
@@ -205,12 +204,16 @@ def main():
         generator=torch.Generator().manual_seed(config.SEED))
     print("Train: {}  Val: {}".format(n_train, n_val), flush=True)
 
-    # Use GroupedStructureSampler to guarantee same-image pairs in every batch.
-    # This is critical for the contrastive loss to fire reliably.
+    # GroupedStructureSampler guarantees same-image pairs in every batch.
+    # Pass train_ds.indices (split indices only) NOT train_ds.dataset
+    # (full dataset) to prevent sampling validation examples during training.
     train_sampler = GroupedStructureSampler(
-        train_ds.dataset, batch_size=config.BATCH_SIZE, shuffle=True)
+        dataset=train_ds.dataset,
+        train_indices=train_ds.indices,
+        batch_size=config.BATCH_SIZE,
+        shuffle=True)
     train_loader = torch.utils.data.DataLoader(
-        train_ds, batch_sampler=None,
+        train_ds,
         batch_size=config.BATCH_SIZE,
         sampler=train_sampler,
         num_workers=4, pin_memory=True, drop_last=True)

@@ -14,9 +14,8 @@ interleaved with his own experiments.
 ## Overview
 1. One-time setup (environment, data, weights)
 2. Edit config.py with your paths
-3. Run a 1-epoch sanity check
-4. Run full training
-5. Send back the log and checkpoint
+3. Run experiments in order (baseline first, then contrastive)
+4. Send back logs and checkpoints after each run
 
 ---
 
@@ -56,7 +55,8 @@ https://github.com/SwinTransformer/storage/releases/download/v1.0.0/swin_base_pa
 
 ### 6. Edit config.py
 Open config.py and set CAMUS_DATA_DIR to the full absolute path of your
-database_nifti folder. This is the only line you need to change:
+database_nifti folder. This is the only line you need to change for the
+baseline run:
 ```python
 CAMUS_DATA_DIR = "/full/absolute/path/to/CAMUS_public/database_nifti"
 ```
@@ -71,8 +71,7 @@ out-of-memory error, lower BATCH_SIZE to 1 in config.py.
 
 ## Running Experiments
 
-Each experiment is a separate independent run. Run them one at a time at
-your convenience — there is no dependency between runs.
+Run experiments IN ORDER. Do not skip ahead.
 
 ### Step A: Create directories (do this once)
 mkdir -p logs experiments/checkpoints
@@ -80,7 +79,7 @@ mkdir -p logs experiments/checkpoints
 ### Step B: Sanity check (do this before any full run)
 Temporarily set EPOCHS = 1 in config.py, then:
 python train_camus.py 2>&1 | tee logs/sanity_run.txt
-Confirm you see all of these in the output:
+Confirm you see:
 - "[*] Device", "[*] GPUs", "[*] Effective batch" lines from startup
 - "Total CAMUS examples: 6000"
 - "Train: 4800  Val: 1200"
@@ -89,24 +88,34 @@ Confirm you see all of these in the output:
 - After the epoch: "Mean IoU: X.XX" and "Overall IoU: X.XX"
 
 Set EPOCHS back to 40 once confirmed.
+NOTE: if you see multiprocessing errors, set num_workers=0 in train_camus.py.
 
-NOTE: if you see multiprocessing errors, set num_workers=0 in train_camus.py
-(line in the DataLoader calls) and retry.
-
-### Step C: Full baseline run
+### Experiment 1: Baseline run (LAVT, no contrastive loss)
+config.py: CONTRASTIVE_WEIGHT = 0.0 (default, do not change)
 python train_camus.py 2>&1 | tee logs/baseline_run.txt
-Runs 40 epochs. Best checkpoint saves to:
-    experiments/checkpoints/model_best_camus.pth
+Checkpoint: experiments/checkpoints/model_best_camus.pth
+
+### Experiment 2: CardioContrast run (with contrastive loss)
+BEFORE RUNNING: open config.py and change:
+```python
+CONTRASTIVE_WEIGHT = 0.1
+```
+Then run:
+python train_camus_contrastive.py 2>&1 | tee logs/contrastive_run.txt
+Checkpoint: experiments/checkpoints/model_best_camus_contrastive.pth
+
+The log prints "contrastive fired X% of steps" each epoch.
+This should be close to 100%. If it shows 0%, stop and message Suhaan.
 
 ### Future experiments
-Additional scripts will appear as the project progresses.
-Suhaan will message you when a new script is ready to run.
+Suhaan will push additional scripts and message you when ready.
+Always git pull before starting a new experiment.
 
 ---
 
 ## After Each Run: Send Back
 - The log file (e.g. logs/baseline_run.txt)
-- The best checkpoint: experiments/checkpoints/model_best_camus.pth
+- The checkpoint from experiments/checkpoints/
   (large file — use Google Drive, NOT GitHub)
 
 ---
@@ -119,7 +128,7 @@ git pull
 ## If Something Breaks
 Send Suhaan:
 - The COMPLETE error message (all of it, not just the last line)
-- Which step failed
+- Which experiment and which step failed
 - The log file if training had already started
 
 Suhaan will fix it, push, and let you know. Then git pull and retry.

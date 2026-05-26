@@ -1,15 +1,26 @@
 """
 lib/contrastive.py — Contrastive Anatomical Differentiation loss for CardioContrast.
 
-Implements the InfoNCE-based contrastive objective that enforces representationally
+Implements a contrastive anatomical repulsion loss that enforces representationally
 distinct decoder activations for different anatomical structures prompted on the
-same image. This is the core contribution of CardioContrast.
+same image. This is the core technical contribution of CardioContrast.
 
-Design:
-1. Hook point: decoder pre-logit features (B, C, H, W) before conv1_1
-2. Masked average pooling over predicted structure region (structure-specific)
-3. 2-layer MLP projection head (SimCLR best practice)
-4. InfoNCE loss with same-image-different-structure negatives, tau=0.07
+NOTE ON LOSS FORMULATION:
+This is an anatomical repulsion loss, not standard InfoNCE. Standard InfoNCE
+requires explicit positives (two augmented views of the same instance). Our
+formulation has no explicit positives — it pushes different anatomical structures
+apart for the same image. This is the correct formulation for our task: we want
+the decoder to produce separable representations for "left ventricle" vs
+"myocardium" vs "left atrium" on the same image. The math is equivalent to the
+denominator term of InfoNCE with the numerator treated as a constant
+(self-similarity = 1/tau). Refer to this as "contrastive anatomical repulsion
+loss" in the paper, not InfoNCE.
+
+Design decisions (all grounded in the paper claims):
+1. Hook point: decoder pre-logit features (B, C, H, W) before conv1_1.
+2. Masked average pooling over predicted structure region (not diluted by background).
+3. 2-layer MLP projection head following SimCLR best practice.
+4. Temperature tau=0.07, fixed following SimCLR, configurable via config.py.
 """
 
 import torch
@@ -18,6 +29,12 @@ import torch.nn.functional as F
 
 
 class ProjectionHead(nn.Module):
+    """
+    2-layer MLP projection head following SimCLR.
+    Projects pooled decoder features into a contrastive embedding space.
+    Keeping this separate from the segmentation head means contrastive
+    optimization does not distort the segmentation features.
+    """
     def __init__(self, in_dim, hidden_dim=None, out_dim=128):
         super().__init__()
         if hidden_dim is None:
@@ -34,29 +51,64 @@ class ProjectionHead(nn.Module):
 
 
 def masked_average_pool(features, mask_logits):
+    """
+    Pool decoder feature map weighted by predicted structure probability.
+    Uses the foreground channel as the pooling weight so background pixels
+    do not dilute the structure-specific representation.
+
+    Args:
+        features:    (B, C, H, W) pre-logit decoder spatial features
+        mask_logits: (B, 2, H, W) decoder output logits (background, foreground)
+
+    Returns:
+        pooled: (B, C) structure-specific feature vector
+    """
     soft_mask = torch.softmax(mask_logits, dim=1)[:, 1:, :, :]
     if soft_mask.shape[-2:] != features.shape[-2:]:
         soft_mask = F.interpolate(soft_mask, size=features.shape[-2:],
-                                  mode='bilinear', align_corners=True)
+                                  mode="bilinear", align_corners=True)
     weighted   = features * soft_mask
     pooled     = weighted.sum(dim=(-2, -1))
     weight_sum = soft_mask.sum(dim=(-2, -1)).clamp(min=1e-6)
     return pooled / weight_sum
 
 
-def info_nce_same_image(embeddings, image_ids, structure_ids, tau=0.07):
+def anatomical_repulsion_loss(embeddings, image_ids, structure_ids, tau=0.07):
+    """
+    Contrastive anatomical repulsion loss with same-image-different-structure
+    negatives.
+
+    For each anchor (image_i, structure_a), negatives are all samples
+    (image_i, structure_b) where b != a. This makes the loss non-redundant
+    with supervised segmentation: the supervised loss treats each prompt as
+    independent; this loss explicitly penalizes similar representations when
+    the prompt changes on the same image.
+
+    Args:
+        embeddings:    (B, D) L2-normalized projected embeddings
+        image_ids:     (B,)  integer source image ID per sample
+        structure_ids: (B,)  structure label (1, 2, 3) per sample
+        tau:           float temperature
+
+    Returns:
+        scalar loss
+    """
     B      = embeddings.size(0)
     device = embeddings.device
+
     sim_matrix    = torch.matmul(embeddings, embeddings.T) / tau
     image_ids     = image_ids.unsqueeze(1)
     structure_ids = structure_ids.unsqueeze(1)
+
     same_image     = (image_ids == image_ids.T)
     same_structure = (structure_ids == structure_ids.T)
     same_sample    = torch.eye(B, dtype=torch.bool, device=device)
     negative_mask  = same_image & ~same_structure & ~same_sample
-    has_negatives  = negative_mask.any(dim=1)
+
+    has_negatives = negative_mask.any(dim=1)
     if not has_negatives.any():
         return torch.tensor(0.0, device=device, requires_grad=True)
+
     losses = []
     for i in range(B):
         if not has_negatives[i]:
@@ -68,6 +120,15 @@ def info_nce_same_image(embeddings, image_ids, structure_ids, tau=0.07):
 
 
 class ContrastiveAnatomicalLoss(nn.Module):
+    """
+    Full contrastive anatomical differentiation loss module.
+    Combines masked average pooling, projection head, and repulsion loss.
+
+    Usage:
+        module = ContrastiveAnatomicalLoss(in_dim=512)
+        loss = module(features, logits, image_ids, structure_ids)
+        total_loss = loss_seg + config.CONTRASTIVE_WEIGHT * loss
+    """
     def __init__(self, in_dim, proj_hidden_dim=None, proj_out_dim=128, tau=0.07):
         super().__init__()
         self.projection_head = ProjectionHead(in_dim, proj_hidden_dim, proj_out_dim)
@@ -77,4 +138,5 @@ class ContrastiveAnatomicalLoss(nn.Module):
         pooled    = masked_average_pool(features, mask_logits)
         projected = self.projection_head(pooled)
         projected = F.normalize(projected, dim=1)
-        return info_nce_same_image(projected, image_ids, structure_ids, self.tau)
+        return anatomical_repulsion_loss(
+            projected, image_ids, structure_ids, self.tau)

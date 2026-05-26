@@ -48,11 +48,15 @@ SEED = 42
 # 4. METHOD HYPERPARAMETERS
 # =====================================================================
 # CONTRASTIVE_WEIGHT: 0.0 = baseline (contrastive loss OFF).
-# Set > 0.0 to enable CardioContrast contrastive loss (future experiment).
+# Set > 0.0 to run the CardioContrast method (e.g. 0.1).
 CONTRASTIVE_WEIGHT = 0.0
 
-# USE_MULTI_STAGE_ATTN: future flag for decoder cross-attention.
-# Currently NOT active in the training script — do not change.
+# CONTRASTIVE_TAU: temperature for the contrastive repulsion loss.
+# Fixed at 0.07 following SimCLR. Ablate if reviewers ask about sensitivity.
+CONTRASTIVE_TAU = 0.07
+
+# USE_MULTI_STAGE_ATTN: placeholder for future decoder cross-attention flag.
+# Currently NOT active in any training script — do not change.
 USE_MULTI_STAGE_ATTN = False
 
 # =====================================================================
@@ -67,13 +71,9 @@ def initialize_environment():
         BATCH_SIZE, GRADIENT_ACCUMULATION_STEPS,
         BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS))
     print("[*] Contrastive     : {}".format(
-        "ON (weight={})".format(CONTRASTIVE_WEIGHT)
+        "ON (weight={}, tau={})".format(CONTRASTIVE_WEIGHT, CONTRASTIVE_TAU)
         if CONTRASTIVE_WEIGHT > 0 else "OFF (baseline)"))
     print("[*] CAMUS data dir  : {}".format(CAMUS_DATA_DIR))
 
 if __name__ == "__main__":
     initialize_environment()
-
-# Contrastive loss temperature (tau). Fixed at 0.07 following SimCLR.
-# Ablate this if reviewers ask about sensitivity.
-CONTRASTIVE_TAU = 0.07
