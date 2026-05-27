@@ -1,17 +1,16 @@
-# train_camus_contrastive.py — CardioContrast full method training.
-# Run AFTER confirming train_camus.py (baseline, Experiment 1) works.
+# train_camus_contrastive.py — CardioContrast ablation training script.
+# Handles Experiments 2, 3, and 4 via config.py switches.
+# Run AFTER confirming train_camus.py (Experiment 1 baseline) works.
 #
-# This script implements BOTH CardioContrast contributions:
-#   1. Multi-stage decoder cross-attention (decode_with_lang=True)
-#   2. Contrastive anatomical repulsion loss (CONTRASTIVE_WEIGHT > 0)
-#
-# Ablation control via config.py:
-#   CONTRASTIVE_WEIGHT=0.0 -> Experiment 2 (decoder CA only, no contrastive)
-#   CONTRASTIVE_WEIGHT=0.1 -> Experiment 3 (full CardioContrast)
+# Ablation conditions (set in config.py before running):
+#   Exp 2 - Decoder CA only:      DECODE_WITH_LANG=True,  CONTRASTIVE_WEIGHT=0.0
+#   Exp 3 - Contrastive only:     DECODE_WITH_LANG=False, CONTRASTIVE_WEIGHT=0.1
+#   Exp 4 - Full CardioContrast:  DECODE_WITH_LANG=True,  CONTRASTIVE_WEIGHT=0.1
 #
 # Usage:
 #   python train_camus_contrastive.py 2>&1 | tee logs/exp2_decoder_ca.txt
-#   python train_camus_contrastive.py 2>&1 | tee logs/exp3_cardiocontrast.txt
+#   python train_camus_contrastive.py 2>&1 | tee logs/exp3_contrastive_only.txt
+#   python train_camus_contrastive.py 2>&1 | tee logs/exp4_cardiocontrast.txt
 
 import os
 import time
@@ -50,15 +49,10 @@ def build_model_args():
 
 
 def get_decoder_hidden_size(swin_type):
-    """
-    Derive decoder hidden_size from Swin backbone type.
-    SimpleDecoding: hidden_size = c4_dims // 2.
-    Swin c4_dims = embed_dim * 8.
-    embed_dim: tiny/small=96, base=128, large=192.
-    """
+    """Derive decoder hidden_size from Swin backbone type.
+    SimpleDecoding: hidden_size = c4_dims // 2 = (embed_dim * 8) // 2."""
     embed_dims = {"tiny": 96, "small": 96, "base": 128, "large": 192}
-    embed_dim  = embed_dims.get(swin_type, 128)
-    return (embed_dim * 8) // 2
+    return (embed_dims.get(swin_type, 128) * 8) // 2
 
 
 def get_transform(img_size):
@@ -103,18 +97,13 @@ def train_one_epoch(model, contrastive_module, optimizer, data_loader,
         sentences     = sentences.squeeze(1)
         attentions    = attentions.squeeze(1)
 
-        # Contribution 1: decode_with_lang=True activates multi-stage
-        # decoder cross-attention at all three refinement stages.
+        # decode_with_lang reads from config — ablation switch for Contribution 1
         logits, pre_logit_features = model(
             image, sentences, l_mask=attentions,
-            return_features=True, decode_with_lang=True)
+            return_features=True, decode_with_lang=config.DECODE_WITH_LANG)
 
-        # Segmentation loss (always active)
-        loss_seg = criterion(logits, target)
-
-        # Contribution 2: contrastive anatomical repulsion loss.
-        # Active when CONTRASTIVE_WEIGHT > 0 in config.py.
-        # Returns 0.0 when weight=0 (Experiment 2 mode).
+        loss_seg  = criterion(logits, target)
+        # Contrastive loss — ablation switch for Contribution 2 (0.0 = off)
         loss_cont = contrastive_module(
             pre_logit_features, logits, image_ids, structure_ids)
 
@@ -172,10 +161,9 @@ def evaluate(model, data_loader):
             attentions = attentions.cuda(non_blocking=True)
             sentences  = sentences.squeeze(1)
             attentions = attentions.squeeze(1)
-            # Evaluation: use decode_with_lang=True (CardioContrast inference mode)
-            output = model(image, sentences, l_mask=attentions,
-                           decode_with_lang=True)
-            iou, I, U = IoU(output, target)
+            output     = model(image, sentences, l_mask=attentions,
+                               decode_with_lang=config.DECODE_WITH_LANG)
+            iou, I, U  = IoU(output, target)
             acc_ious  += iou
             mean_IoU.append(iou)
             cum_I += I
@@ -194,20 +182,28 @@ def main():
     config.initialize_environment()
     set_seed(config.SEED)
     assert torch.cuda.is_available(), "CUDA GPU required. Run on the lab machine."
-    assert config.CONTRASTIVE_WEIGHT >= 0.0, "CONTRASTIVE_WEIGHT must be >= 0.0"
+    assert config.DECODE_WITH_LANG or config.CONTRASTIVE_WEIGHT > 0.0, (
+        "At least one of DECODE_WITH_LANG=True or CONTRASTIVE_WEIGHT>0.0 must be "
+        "set. For the plain baseline, use train_camus.py instead.")
 
     model_args          = build_model_args()
     transform           = get_transform(config.IMG_SIZE)
     decoder_hidden_size = get_decoder_hidden_size(config.SWIN_TYPE)
     print("Decoder hidden size: {}".format(decoder_hidden_size), flush=True)
-    print("Contrastive weight: {}  tau: {}".format(
-        config.CONTRASTIVE_WEIGHT, config.CONTRASTIVE_TAU), flush=True)
-    if config.CONTRASTIVE_WEIGHT == 0.0:
-        print("Mode: Experiment 2 — decoder cross-attention only, no contrastive loss",
-              flush=True)
-    else:
-        print("Mode: Experiment 3 — full CardioContrast (decoder CA + contrastive loss)",
-              flush=True)
+
+    # Print which ablation condition is running
+    ca_status   = "ON" if config.DECODE_WITH_LANG else "OFF"
+    cont_status = "ON (weight={}, tau={})".format(
+        config.CONTRASTIVE_WEIGHT, config.CONTRASTIVE_TAU) \
+        if config.CONTRASTIVE_WEIGHT > 0 else "OFF"
+    print("Decoder cross-attention : {}".format(ca_status), flush=True)
+    print("Contrastive loss        : {}".format(cont_status), flush=True)
+    if config.DECODE_WITH_LANG and config.CONTRASTIVE_WEIGHT > 0:
+        print("Mode: Experiment 4 - Full CardioContrast (both contributions)", flush=True)
+    elif config.DECODE_WITH_LANG:
+        print("Mode: Experiment 2 - Decoder cross-attention only", flush=True)
+    elif config.CONTRASTIVE_WEIGHT > 0:
+        print("Mode: Experiment 3 - Contrastive loss only", flush=True)
 
     from data.dataset_camus_contrastive import CAMUSDatasetContrastive
     full_dataset = CAMUSDatasetContrastive(
@@ -218,11 +214,8 @@ def main():
     print("Total CAMUS examples: {}".format(len(full_dataset)), flush=True)
     if len(full_dataset) == 0:
         raise ValueError(
-            "No CAMUS samples found. Check that CAMUS_DATA_DIR in config.py "
-            "points to the database_nifti folder containing patient* subfolders.")
+            "No CAMUS samples found. Check CAMUS_DATA_DIR in config.py.")
 
-    # NOTE: random 80/20 split seeded for reproducibility.
-    # TODO: replace with patient-level split before reporting final paper results.
     n_total = len(full_dataset)
     n_val   = int(0.2 * n_total)
     n_train = n_total - n_val
@@ -231,9 +224,8 @@ def main():
         generator=torch.Generator().manual_seed(config.SEED))
     print("Train: {}  Val: {}".format(n_train, n_val), flush=True)
 
-    # GroupedStructureSampler guarantees same-image pairs in every batch.
-    # IMPORTANT: pass train_ds.indices (split indices only), NOT train_ds.dataset
-    # (full dataset), to prevent sampling validation examples during training.
+    # Pass train_ds.indices (not train_ds.dataset) to prevent sampling
+    # validation examples during training (data leakage prevention).
     train_sampler = GroupedStructureSampler(
         dataset=train_ds.dataset,
         train_indices=train_ds.indices,
@@ -269,7 +261,8 @@ def main():
     backbone_no_decay = []
     backbone_decay    = []
     for name, m in raw_model.backbone.named_parameters():
-        if 'norm' in name or 'absolute_pos_embed' in name or 'relative_position_bias_table' in name:
+        if 'norm' in name or 'absolute_pos_embed' in name \
+                or 'relative_position_bias_table' in name:
             backbone_no_decay.append(m)
         else:
             backbone_decay.append(m)
@@ -307,6 +300,7 @@ def main():
                 'model':              raw_model.state_dict(),
                 'contrastive_module': contrastive_module.state_dict(),
                 'epoch':              epoch,
+                'decode_with_lang':   config.DECODE_WITH_LANG,
                 'contrastive_weight': config.CONTRASTIVE_WEIGHT,
                 'tau':                config.CONTRASTIVE_TAU,
             }, save_path)
