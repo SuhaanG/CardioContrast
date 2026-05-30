@@ -294,8 +294,13 @@ def main():
 
         if overall_IoU > best_oIoU:
             best_oIoU = overall_IoU
-            save_path = os.path.join(
-                config.CHECKPOINT_DIR, "model_best_camus_contrastive.pth")
+            if config.DECODE_WITH_LANG and config.CONTRASTIVE_WEIGHT > 0:
+                ckpt_name = "model_best_exp4_cardiocontrast.pth"
+            elif config.DECODE_WITH_LANG:
+                ckpt_name = "model_best_exp2_decoder_ca.pth"
+            else:
+                ckpt_name = "model_best_exp3_contrastive_only.pth"
+            save_path = os.path.join(config.CHECKPOINT_DIR, ckpt_name)
             torch.save({
                 'model':              raw_model.state_dict(),
                 'contrastive_module': contrastive_module.state_dict(),
