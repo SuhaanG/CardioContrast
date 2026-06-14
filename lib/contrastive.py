@@ -81,9 +81,9 @@ def anatomical_repulsion_loss(embeddings, image_ids, structure_ids, tau=0.07):
     the loss has a natural minimum of zero when all same-image cross-structure
     similarities are maximally negative, producing interpretable loss curves.
 
-    L = (1/|A|) * sum_{i in A} softplus(sum_{j in N(i)} sim(g_i, g_j) / tau)
+    L = (1/|A|) * sum_{i in A} sum_{j in N(i)} softplus(sim(g_i, g_j) / tau)
 
-    where softplus(x) = log(1 + exp(x)).
+    where softplus(x) = log(1 + exp(x)), applied per pair independently.
 
     Args:
         embeddings:    (B, D) L2-normalized projected embeddings
