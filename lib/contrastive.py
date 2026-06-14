@@ -19,6 +19,7 @@ Design decisions:
 2. Masked average pooling over predicted structure region (not diluted by background).
 3. 2-layer MLP projection head following SimCLR best practice.
 4. Temperature tau=0.07, fixed following SimCLR, configurable via config.py.
+5. Softplus repulsion loss: natural zero minimum, interpretable loss curves.
 """
 
 import torch
@@ -51,8 +52,9 @@ class ProjectionHead(nn.Module):
 def masked_average_pool(features, mask_logits):
     """
     Pool decoder feature map weighted by predicted structure probability.
-    Uses only the foreground channel as the pooling weight so background pixels
-    do not dilute the structure-specific representation.
+    Uses the foreground channel of the softmax-normalized two-channel logits
+    as the pooling weight, so background pixels do not dilute the
+    structure-specific representation.
 
     Args:
         features:    (B, C, H, W) pre-logit decoder spatial features
@@ -72,14 +74,16 @@ def masked_average_pool(features, mask_logits):
 
 def anatomical_repulsion_loss(embeddings, image_ids, structure_ids, tau=0.07):
     """
-    Contrastive anatomical repulsion loss with same-image-different-structure
-    negatives.
+    Contrastive anatomical repulsion loss using softplus formulation.
 
     For each anchor (image_i, structure_a), negatives are all samples
-    (image_i, structure_b) where b != a. This makes the loss non-redundant
-    with supervised segmentation: the supervised loss treats each prompt
-    independently; this loss explicitly penalizes similar representations when
-    the prompt changes on the same image.
+    (image_i, structure_b) where b != a. The softplus formulation ensures
+    the loss has a natural minimum of zero when all same-image cross-structure
+    similarities are maximally negative, producing interpretable loss curves.
+
+    L = (1/|A|) * sum_{i in A} softplus(sum_{j in N(i)} sim(g_i, g_j) / tau)
+
+    where softplus(x) = log(1 + exp(x)).
 
     Args:
         embeddings:    (B, D) L2-normalized projected embeddings
@@ -110,7 +114,9 @@ def anatomical_repulsion_loss(embeddings, image_ids, structure_ids, tau=0.07):
         if not has_negatives[i]:
             continue
         neg_sims = sim_matrix[i][negative_mask[i]]
-        loss_i   = torch.log(torch.exp(neg_sims).sum() + 1e-8)
+        # Softplus of the sum of negative similarities.
+        # Natural minimum is zero; increases monotonically with similarity.
+        loss_i = F.softplus(neg_sims.sum())
         losses.append(loss_i)
     return torch.stack(losses).mean()
 
