@@ -8,7 +8,7 @@ from PIL import Image
 from bert.tokenization_bert import BertTokenizer
 
 STRUCTURE_PROMPTS = {
-    1: "the left ventricle",
+    1: "the left ventricular endocardium",
     2: "the myocardium",
     3: "the left atrium",
 }
