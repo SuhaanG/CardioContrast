@@ -1,6 +1,5 @@
 # train_camus_contrastive.py — CardioContrast ablation training script.
 # Handles Experiments 2, 3, and 4 via config.py switches.
-# Run AFTER confirming train_camus.py (Experiment 1 baseline) works.
 #
 # Ablation conditions (set in config.py before running):
 #   Exp 2 - Decoder CA only:      DECODE_WITH_LANG=True,  CONTRASTIVE_WEIGHT=0.0
@@ -49,8 +48,6 @@ def build_model_args():
 
 
 def get_decoder_hidden_size(swin_type):
-    """Derive decoder hidden_size from Swin backbone type.
-    SimpleDecoding: hidden_size = c4_dims // 2 = (embed_dim * 8) // 2."""
     embed_dims = {"tiny": 96, "small": 96, "base": 128, "large": 192}
     return (embed_dims.get(swin_type, 128) * 8) // 2
 
@@ -77,6 +74,44 @@ def IoU(pred, gt):
     return float(intersection) / float(union), intersection, union
 
 
+def patient_split(full_dataset, val_fraction=0.2, seed=42):
+    """
+    Split dataset by patient ID to prevent data leakage.
+    All samples from a given patient go entirely to train or val.
+    """
+    import random
+    rng = random.Random(seed)
+
+    patient_ids = sorted(set(
+        os.path.basename(os.path.dirname(s["image_path"]))
+        for s in full_dataset.samples
+    ))
+    rng.shuffle(patient_ids)
+
+    n_val_patients = max(1, int(len(patient_ids) * val_fraction))
+    val_patients   = set(patient_ids[:n_val_patients])
+    train_patients = set(patient_ids[n_val_patients:])
+
+    train_indices = [
+        i for i, s in enumerate(full_dataset.samples)
+        if os.path.basename(os.path.dirname(s["image_path"])) in train_patients
+    ]
+    val_indices = [
+        i for i, s in enumerate(full_dataset.samples)
+        if os.path.basename(os.path.dirname(s["image_path"])) in val_patients
+    ]
+
+    train_ds = torch.utils.data.Subset(full_dataset, train_indices)
+    val_ds   = torch.utils.data.Subset(full_dataset, val_indices)
+
+    print("Patients — train: {}  val: {}".format(
+        len(train_patients), len(val_patients)), flush=True)
+    print("Samples  — train: {}  val: {}".format(
+        len(train_indices), len(val_indices)), flush=True)
+
+    return train_ds, val_ds, train_indices
+
+
 def train_one_epoch(model, contrastive_module, optimizer, data_loader,
                     lr_scheduler, epoch, print_freq):
     model.train()
@@ -97,13 +132,11 @@ def train_one_epoch(model, contrastive_module, optimizer, data_loader,
         sentences     = sentences.squeeze(1)
         attentions    = attentions.squeeze(1)
 
-        # decode_with_lang reads from config — ablation switch for Contribution 1
         logits, pre_logit_features = model(
             image, sentences, l_mask=attentions,
             return_features=True, decode_with_lang=config.DECODE_WITH_LANG)
 
         loss_seg  = criterion(logits, target)
-        # Contrastive loss — ablation switch for Contribution 2 (0.0 = off)
         loss_cont = contrastive_module(
             pre_logit_features, logits, image_ids, structure_ids)
 
@@ -145,15 +178,11 @@ def train_one_epoch(model, contrastive_module, optimizer, data_loader,
 
 def evaluate(model, data_loader):
     model.eval()
-    acc_ious = total_its = 0
     cum_I = cum_U = 0
-    eval_seg_iou_list = [.5, .6, .7, .8, .9]
-    seg_correct = np.zeros(len(eval_seg_iou_list), dtype=np.int32)
     mean_IoU = []
 
     with torch.no_grad():
         for data in data_loader:
-            total_its += 1
             image, target, sentences, attentions = data[0], data[1], data[2], data[3]
             image      = image.cuda(non_blocking=True)
             target     = target.cuda(non_blocking=True)
@@ -164,12 +193,9 @@ def evaluate(model, data_loader):
             output     = model(image, sentences, l_mask=attentions,
                                decode_with_lang=config.DECODE_WITH_LANG)
             iou, I, U  = IoU(output, target)
-            acc_ious  += iou
             mean_IoU.append(iou)
             cum_I += I
             cum_U += U
-            for n in range(len(eval_seg_iou_list)):
-                seg_correct[n] += (iou >= eval_seg_iou_list[n])
 
     mIoU        = np.mean(np.array(mean_IoU)) if mean_IoU else 0.0
     overall_IoU = (100. * cum_I / cum_U) if cum_U > 0 else 0.0
@@ -191,7 +217,6 @@ def main():
     decoder_hidden_size = get_decoder_hidden_size(config.SWIN_TYPE)
     print("Decoder hidden size: {}".format(decoder_hidden_size), flush=True)
 
-    # Print which ablation condition is running
     ca_status   = "ON" if config.DECODE_WITH_LANG else "OFF"
     cont_status = "ON (weight={}, tau={})".format(
         config.CONTRASTIVE_WEIGHT, config.CONTRASTIVE_TAU) \
@@ -199,7 +224,7 @@ def main():
     print("Decoder cross-attention : {}".format(ca_status), flush=True)
     print("Contrastive loss        : {}".format(cont_status), flush=True)
     if config.DECODE_WITH_LANG and config.CONTRASTIVE_WEIGHT > 0:
-        print("Mode: Experiment 4 - Full CardioContrast (both contributions)", flush=True)
+        print("Mode: Experiment 4 - Full CardioContrast", flush=True)
     elif config.DECODE_WITH_LANG:
         print("Mode: Experiment 2 - Decoder cross-attention only", flush=True)
     elif config.CONTRASTIVE_WEIGHT > 0:
@@ -213,22 +238,14 @@ def main():
     )
     print("Total CAMUS examples: {}".format(len(full_dataset)), flush=True)
     if len(full_dataset) == 0:
-        raise ValueError(
-            "No CAMUS samples found. Check CAMUS_DATA_DIR in config.py.")
+        raise ValueError("No CAMUS samples found. Check CAMUS_DATA_DIR in config.py.")
 
-    n_total = len(full_dataset)
-    n_val   = int(0.2 * n_total)
-    n_train = n_total - n_val
-    train_ds, val_ds = torch.utils.data.random_split(
-        full_dataset, [n_train, n_val],
-        generator=torch.Generator().manual_seed(config.SEED))
-    print("Train: {}  Val: {}".format(n_train, n_val), flush=True)
+    train_ds, val_ds, train_indices = patient_split(
+        full_dataset, val_fraction=0.2, seed=config.SEED)
 
-    # Pass train_ds.indices (not train_ds.dataset) to prevent sampling
-    # validation examples during training (data leakage prevention).
     train_sampler = GroupedStructureSampler(
-        dataset=train_ds.dataset,
-        train_indices=train_ds.indices,
+        dataset=full_dataset,
+        train_indices=train_indices,
         batch_size=config.BATCH_SIZE,
         shuffle=True)
     train_loader = torch.utils.data.DataLoader(
