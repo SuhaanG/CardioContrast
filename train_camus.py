@@ -243,10 +243,13 @@ def main():
     optimizer = torch.optim.AdamW(
         params_to_optimize, lr=config.LR, weight_decay=config.WEIGHT_DECAY)
 
-    total_steps = (len(train_loader) // config.GRADIENT_ACCUMULATION_STEPS) * config.EPOCHS
-    lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
-        optimizer,
-        lambda x: (1 - x / total_steps) ** 0.9)
+    total_steps  = (len(train_loader) // config.GRADIENT_ACCUMULATION_STEPS) * config.EPOCHS
+    warmup_steps = 500
+    def lr_lambda(current_step):
+        if current_step < warmup_steps:
+            return float(current_step) / float(max(1, warmup_steps))
+        return max(0.0, (1 - (current_step - warmup_steps) / max(1, total_steps - warmup_steps)) ** 0.9)
+    lr_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
     best_oIoU  = -1.0
     start_time = time.time()
