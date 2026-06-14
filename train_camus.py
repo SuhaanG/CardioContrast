@@ -1,5 +1,5 @@
 # train_camus.py — Multi-GPU training of LAVT on the CAMUS dataset.
-# Runs on 2x RTX A4000 (24GB) using gradient accumulation and DataParallel.
+# Runs on 2x RTX A5000 using gradient accumulation and DataParallel.
 #
 # Usage:
 #   python train_camus.py 2>&1 | tee logs/baseline_run.txt
@@ -23,7 +23,6 @@ import config
 
 
 def set_seed(seed):
-    """Seed all random sources for full reproducibility."""
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     np.random.seed(seed)
@@ -64,6 +63,44 @@ def IoU(pred, gt):
     return float(intersection) / float(union), intersection, union
 
 
+def patient_split(full_dataset, val_fraction=0.2, seed=42):
+    """
+    Split dataset by patient ID to prevent data leakage.
+    All samples from a given patient go entirely to train or val.
+    """
+    import random
+    rng = random.Random(seed)
+
+    patient_ids = sorted(set(
+        os.path.basename(os.path.dirname(s["image_path"]))
+        for s in full_dataset.samples
+    ))
+    rng.shuffle(patient_ids)
+
+    n_val_patients = max(1, int(len(patient_ids) * val_fraction))
+    val_patients   = set(patient_ids[:n_val_patients])
+    train_patients = set(patient_ids[n_val_patients:])
+
+    train_indices = [
+        i for i, s in enumerate(full_dataset.samples)
+        if os.path.basename(os.path.dirname(s["image_path"])) in train_patients
+    ]
+    val_indices = [
+        i for i, s in enumerate(full_dataset.samples)
+        if os.path.basename(os.path.dirname(s["image_path"])) in val_patients
+    ]
+
+    train_ds = torch.utils.data.Subset(full_dataset, train_indices)
+    val_ds   = torch.utils.data.Subset(full_dataset, val_indices)
+
+    print("Patients — train: {}  val: {}".format(
+        len(train_patients), len(val_patients)), flush=True)
+    print("Samples  — train: {}  val: {}".format(
+        len(train_indices), len(val_indices)), flush=True)
+
+    return train_ds, val_ds, train_indices
+
+
 def train_one_epoch(model, optimizer, data_loader, lr_scheduler, epoch, print_freq):
     model.train()
     running_loss = 0.0
@@ -83,9 +120,6 @@ def train_one_epoch(model, optimizer, data_loader, lr_scheduler, epoch, print_fr
         output = model(image, sentences, l_mask=attentions)
         loss   = criterion(output, target)
 
-        # TODO: add contrastive loss here when implementing CardioContrast
-        # loss_contrastive = contrastive_loss(decoder_activations, prompts)
-        # total_loss = loss + config.CONTRASTIVE_WEIGHT * loss_contrastive
         total_loss  = loss
         scaled_loss = total_loss / config.GRADIENT_ACCUMULATION_STEPS
         scaled_loss.backward()
@@ -174,16 +208,8 @@ def main():
             "points to the database_nifti folder containing patient* subfolders."
         )
 
-    # NOTE: this is a random 80/20 sample-level split seeded for reproducibility.
-    # TODO: replace with a patient-level split before reporting final paper results,
-    # to prevent the same patient appearing in both train and val (data leakage).
-    n_total = len(full_dataset)
-    n_val   = int(0.2 * n_total)
-    n_train = n_total - n_val
-    train_ds, val_ds = torch.utils.data.random_split(
-        full_dataset, [n_train, n_val],
-        generator=torch.Generator().manual_seed(config.SEED))
-    print("Train: {}  Val: {}".format(n_train, n_val), flush=True)
+    train_ds, val_ds, _ = patient_split(
+        full_dataset, val_fraction=0.2, seed=config.SEED)
 
     train_loader = torch.utils.data.DataLoader(
         train_ds, batch_size=config.BATCH_SIZE, shuffle=True,
