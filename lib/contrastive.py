@@ -114,9 +114,10 @@ def anatomical_repulsion_loss(embeddings, image_ids, structure_ids, tau=0.07):
         if not has_negatives[i]:
             continue
         neg_sims = sim_matrix[i][negative_mask[i]]
-        # Softplus of the sum of negative similarities.
-        # Natural minimum is zero; increases monotonically with similarity.
-        loss_i = F.softplus(neg_sims.sum())
+        # Softplus applied per pair, then summed.
+        # Penalizes each collapsed pair independently; cancellation
+        # between pairs is not possible. Natural minimum is zero.
+        loss_i = F.softplus(neg_sims).sum()
         losses.append(loss_i)
     return torch.stack(losses).mean()
 
