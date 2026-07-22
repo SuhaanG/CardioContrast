@@ -112,7 +112,7 @@ def official_camus_split(full_dataset):
 
 
 def train_one_epoch(model, contrastive_module, optimizer, data_loader,
-                    lr_scheduler, epoch, print_freq):
+                    lr_scheduler, epoch, print_freq=100):
     model.train()
     contrastive_module.train()
     running_loss_seg = running_loss_cont = 0.0

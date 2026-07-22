@@ -25,12 +25,12 @@ GPU_IDS = [0, 1] if torch.cuda.device_count() > 1 else [0]
 # =====================================================================
 # 3. TRAINING HYPERPARAMETERS
 # =====================================================================
-BATCH_SIZE                  = 4
+BATCH_SIZE                  = 2
 GRADIENT_ACCUMULATION_STEPS = 4
 LR           = 0.00005
 WEIGHT_DECAY = 1e-2
 EPOCHS       = 40
-IMG_SIZE     = 480
+IMG_SIZE     = 352
 SWIN_TYPE    = "base"
 SEED         = 42
 

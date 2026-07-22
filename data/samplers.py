@@ -66,4 +66,4 @@ class GroupedStructureSampler(Sampler):
             yield from batch[:self.batch_size]
 
     def __len__(self):
-        return len(self.all_pos_idx)
+        return len(self.image_keys) * self.batch_size
