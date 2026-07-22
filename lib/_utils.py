@@ -3,7 +3,6 @@ import sys
 import torch
 from torch import nn
 from torch.nn import functional as F
-from transformers import BertModel
 
 
 class _LAVTSimpleDecode(nn.Module):
@@ -46,6 +45,7 @@ class LAVT(_LAVTSimpleDecode):
 class _LAVTOneSimpleDecode(nn.Module):
     def __init__(self, backbone, classifier, args):
         super(_LAVTOneSimpleDecode, self).__init__()
+        from transformers import BertModel
         self.backbone     = backbone
         self.classifier   = classifier
         self.text_encoder = BertModel.from_pretrained(args.ck_bert)
