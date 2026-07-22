@@ -307,7 +307,7 @@ def main():
 
     for epoch in range(config.EPOCHS):
         train_one_epoch(model, contrastive_module, optimizer,
-                        train_loader, lr_scheduler, epoch, print_freq=10)
+                        train_loader, lr_scheduler, epoch, print_freq=100)
         mIoU, overall_IoU = evaluate(model, val_loader)
 
         if overall_IoU > best_oIoU:
