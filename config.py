@@ -8,12 +8,12 @@ import torch
 # =====================================================================
 # 1. PATHS — EDIT THESE TO MATCH YOUR MACHINE
 # =====================================================================
-CAMUS_DATA_DIR   = "/path/to/CAMUS_public/database_nifti"
-ECHONET_DATA_DIR = "/path/to/EchoNet"
-PRETRAINED_SWIN  = "./pretrained_weights/swin_base_patch4_window12_384_22k.pth"
-CHECKPOINT_DIR   = "./experiments/checkpoints"
-OUTPUT_DIR       = "./experiments/outputs"
-LOG_DIR          = "./logs"
+CAMUS_DATA_DIR   = "/content/CAMUS_public/database_nifti"
+ECHONET_DATA_DIR = "/content/EchoNet"
+PRETRAINED_SWIN  = "/content/CardioContrast/pretrained_weights/swin_base_patch4_window12_384_22k.pth"
+CHECKPOINT_DIR   = "/content/CardioContrast/experiments/checkpoints"
+OUTPUT_DIR       = "/content/CardioContrast/experiments/outputs"
+LOG_DIR          = "/content/CardioContrast/logs"
 
 # =====================================================================
 # 2. COMPUTE CONFIGURATION
