@@ -1,14 +1,13 @@
 """
 data/samplers.py — Custom batch sampler for contrastive training.
 
-Guarantees every batch contains all 3 structure prompts from at least one
-image, so the contrastive loss always has same-image-different-structure
-negative pairs. Without this, random sampling puts the same image structures
-in the same batch with ~0.4% probability per step, meaning the contrastive
-loss fires almost never.
+Guarantees every batch contains all 3 structure prompts from the same image,
+so the contrastive loss always has same-image-different-structure negative pairs.
 
-IMPORTANT: always pass train_indices (the split indices, not the full dataset)
-to prevent sampling validation examples during training.
+Fix: the original sampler passed full-dataset indices to a DataLoader that wraps
+a Subset. The Subset re-indexes from 0, so full-dataset indices were fetching
+wrong samples. This version works directly with the Subset by using
+positional indices into train_ds, not into the full dataset.
 """
 
 import numpy as np
@@ -18,56 +17,53 @@ from collections import defaultdict
 
 class GroupedStructureSampler(Sampler):
     """
-    Each batch is guaranteed to contain all 3 structures from at least one
-    anchor image. Remaining batch slots are filled with random samples.
+    Each batch is guaranteed to contain all 3 structures from the same image.
+    Works on the Subset directly using positional indices into train_ds.
 
     Args:
-        dataset:       CAMUSDatasetContrastive instance (full dataset)
-        train_indices: list of integer indices belonging to the train split.
-                       Must be train-split indices only, not all indices,
-                       to prevent sampling from the validation set.
-        batch_size:    physical batch size
-        shuffle:       shuffle image order each epoch
+        train_ds:   torch.utils.data.Subset (the training split)
+        batch_size: must be >= 3 to fit all 3 structures from one image
+        shuffle:    shuffle image order each epoch
     """
-    def __init__(self, dataset, train_indices, batch_size, shuffle=True):
-        self.batch_size    = batch_size
-        self.shuffle       = shuffle
-        self.train_indices = list(train_indices)
+    def __init__(self, train_ds, batch_size, shuffle=True):
+        assert batch_size >= 3, "batch_size must be >= 3 to fit all 3 structures"
+        self.batch_size = batch_size
+        self.shuffle    = shuffle
 
+        # Group positional indices (0..len(train_ds)-1) by image_idx
         self.groups = defaultdict(list)
-        for idx in self.train_indices:
-            sample = dataset.samples[idx]
-            self.groups[sample["image_idx"]].append(idx)
+        for pos, full_idx in enumerate(train_ds.indices):
+            sample = train_ds.dataset.samples[full_idx]
+            self.groups[sample["image_idx"]].append(pos)
 
-        self.image_keys = list(self.groups.keys())
+        self.image_keys  = list(self.groups.keys())
+        self.all_pos_idx = list(range(len(train_ds)))
 
     def __iter__(self):
-        image_keys    = self.image_keys.copy()
-        all_train_idx = self.train_indices.copy()
+        image_keys  = self.image_keys.copy()
+        all_pos_idx = self.all_pos_idx.copy()
         if self.shuffle:
             np.random.shuffle(image_keys)
-            np.random.shuffle(all_train_idx)
+            np.random.shuffle(all_pos_idx)
 
-        ptr = 0
+        fill_pool = iter(all_pos_idx)
+
         for key in image_keys:
-            group     = self.groups[key]
-            remaining = self.batch_size - len(group)
-            fill      = []
-            attempts  = 0
-            while len(fill) < max(0, remaining):
-                if ptr >= len(all_train_idx):
-                    np.random.shuffle(all_train_idx)
-                    ptr = 0
-                if all_train_idx[ptr] not in group:
-                    fill.append(all_train_idx[ptr])
-                ptr += 1
-                attempts += 1
-                if attempts > len(all_train_idx) * 2:
-                    break
-            batch = (group + fill)[:self.batch_size]
+            group = self.groups[key]           # positional indices for this image
+            batch = list(group[:3])            # take all 3 structures (labels 1,2,3)
+            while len(batch) < self.batch_size:
+                try:
+                    candidate = next(fill_pool)
+                except StopIteration:
+                    all_pos_idx = self.all_pos_idx.copy()
+                    np.random.shuffle(all_pos_idx)
+                    fill_pool = iter(all_pos_idx)
+                    candidate = next(fill_pool)
+                if candidate not in group:
+                    batch.append(candidate)
             if self.shuffle:
                 np.random.shuffle(batch)
-            yield from batch
+            yield from batch[:self.batch_size]
 
     def __len__(self):
-        return len(self.train_indices)
+        return len(self.all_pos_idx)

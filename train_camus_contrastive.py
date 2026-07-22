@@ -236,11 +236,10 @@ def main():
     if len(full_dataset) == 0:
         raise ValueError("No CAMUS samples found. Check CAMUS_DATA_DIR in config.py.")
 
-    train_ds, val_ds, train_indices = official_camus_split(full_dataset)
+    train_ds, val_ds, _ = official_camus_split(full_dataset)
 
     train_sampler = GroupedStructureSampler(
-        dataset=full_dataset,
-        train_indices=train_indices,
+        train_ds=train_ds,
         batch_size=config.BATCH_SIZE,
         shuffle=True)
     train_loader = torch.utils.data.DataLoader(
