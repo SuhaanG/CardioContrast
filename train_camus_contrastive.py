@@ -11,6 +11,9 @@
 #   python train_camus_contrastive.py 2>&1 | tee logs/exp3_contrastive_only.txt
 #   python train_camus_contrastive.py 2>&1 | tee logs/exp4_cardiocontrast.txt
 
+from transformers import BertModel, BertTokenizer
+_ = BertTokenizer.from_pretrained("bert-base-uncased")
+
 import os
 import time
 import datetime
