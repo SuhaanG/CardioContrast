@@ -26,7 +26,7 @@ class CAMUSDatasetContrastive(data.Dataset):
         self.data_dir         = data_dir
         self.image_transforms = image_transforms
         self.max_tokens       = max_tokens
-        self.tokenizer        = BertTokenizer.from_pretrained(bert_tokenizer)
+        self.tokenizer = BertTokenizer.from_pretrained(bert_tokenizer)
         self.samples          = self._build_index()
 
     def _build_index(self):

@@ -45,8 +45,8 @@ def build_model_args():
         model="lavt_one", swin_type=config.SWIN_TYPE,
         mha="", fusion_drop=0.0, window12=True,
         img_size=config.IMG_SIZE,
-        bert_tokenizer="bert-base-uncased",
-        ck_bert="bert-base-uncased",
+        bert_tokenizer=config.BERT_PATH,
+        ck_bert=config.BERT_PATH,
     )
 
 

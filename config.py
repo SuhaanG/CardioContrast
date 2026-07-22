@@ -14,6 +14,7 @@ PRETRAINED_SWIN  = "/content/CardioContrast/pretrained_weights/swin_base_patch4_
 CHECKPOINT_DIR   = "/content/CardioContrast/experiments/checkpoints"
 OUTPUT_DIR       = "/content/CardioContrast/experiments/outputs"
 LOG_DIR          = "/content/CardioContrast/logs"
+BERT_PATH = "/content/bert-base-uncased"
 
 # =====================================================================
 # 2. COMPUTE CONFIGURATION
