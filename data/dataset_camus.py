@@ -5,7 +5,7 @@ import nibabel as nib
 import torch
 import torch.utils.data as data
 from PIL import Image
-from bert.tokenization_bert import BertTokenizer
+from transformers import BertTokenizer
 
 STRUCTURE_PROMPTS = {
     1: "the left ventricular endocardium",
