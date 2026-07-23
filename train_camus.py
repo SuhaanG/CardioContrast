@@ -99,7 +99,7 @@ def official_camus_split(full_dataset):
     return train_ds, val_ds, train_indices
 
 
-def train_one_epoch(model, optimizer, data_loader, lr_scheduler, epoch, print_freq):
+def train_one_epoch(model, optimizer, data_loader, lr_scheduler, epoch, print_freq=150):
     model.train()
     running_loss = 0.0
     n_batches    = 0
@@ -258,7 +258,7 @@ def main():
 
     for epoch in range(config.EPOCHS):
         train_one_epoch(model, optimizer, train_loader, lr_scheduler,
-                        epoch, print_freq=10)
+                        epoch, print_freq=150)
         mIoU, overall_IoU = evaluate(model, val_loader)
 
         if overall_IoU > best_oIoU:
