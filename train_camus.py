@@ -3,6 +3,8 @@
 #
 # Usage:
 #   python train_camus.py 2>&1 | tee logs/baseline_run.txt
+from transformers import BertModel, BertTokenizer
+_ = BertTokenizer.from_pretrained("bert-base-uncased")
 
 import os
 import time
@@ -36,8 +38,8 @@ def build_model_args():
         fusion_drop=0.0,
         window12=True,
         img_size=config.IMG_SIZE,
-        bert_tokenizer="bert-base-uncased",
-        ck_bert="bert-base-uncased",
+        bert_tokenizer=config.BERT_PATH,
+        ck_bert=config.BERT_PATH,
     )
 
 
