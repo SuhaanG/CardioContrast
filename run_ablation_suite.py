@@ -1,7 +1,9 @@
 import argparse
+import json
 import os
 import subprocess
 import sys
+from pathlib import Path
 from typing import Dict, List
 
 import config
@@ -40,6 +42,8 @@ def run_experiments(experiment_order=None, dry_run=False):
     if experiment_order is None:
         experiment_order = DEFAULT_EXPERIMENT_ORDER
     results = []
+    manifest_root = Path(config.CC_OUTPUT_ROOT) / "paper"
+    manifest_root.mkdir(parents=True, exist_ok=True)
     for name in experiment_order:
         if name not in config.PRESETS and name != "exp1_baseline":
             raise KeyError(f"Unknown preset: {name}")
@@ -48,22 +52,43 @@ def run_experiments(experiment_order=None, dry_run=False):
         summary = {
             "experiment": name,
             "command": " ".join(command),
-            "decode_with_lang": env.get("CC_DECODE_WITH_LANG", "0"),
-            "contrastive_weight": env.get("CC_CONTRASTIVE_WEIGHT", "0.0"),
+            "decode_with_lang": bool(int(env.get("CC_DECODE_WITH_LANG", "0"))),
+            "contrastive_weight": float(env.get("CC_CONTRASTIVE_WEIGHT", "0.0")),
+            "val_split_used_for_selection": True,
+            "test_split_reserved_for_final_report": True,
+            "split_policy": {
+                "train": "patient-level",
+                "val": "for model selection only",
+                "test": "held back for final reporting",
+            },
             "env": env,
         }
         if dry_run:
             print(f"[dry-run] {name}: {' '.join(command)}")
             print(f"  decode_with_lang={summary['decode_with_lang']} contrastive_weight={summary['contrastive_weight']}")
+            print("  split_policy: val for selection, test reserved for final report")
         else:
             print(f"[run] starting {name} ...")
             completed = subprocess.run(command, env=env, cwd=os.path.dirname(os.path.abspath(__file__)))
             if completed.returncode != 0:
                 print(f"[error] {name} failed with exit code {completed.returncode}")
-                results.append({"experiment": name, "status": "failed", "returncode": completed.returncode})
+                summary["status"] = "failed"
+                summary["returncode"] = completed.returncode
+                results.append(summary)
+                manifest_path = manifest_root / f"{name}_manifest.json"
+                manifest_path.write_text(json.dumps(summary, indent=2, sort_keys=True))
                 break
-            results.append({"experiment": name, "status": "ok", "returncode": 0})
+            summary["status"] = "ok"
+            summary["returncode"] = 0
+            summary["checkpoint_dir"] = str(Path(config.CC_OUTPUT_ROOT) / "checkpoints")
+            summary["best_checkpoint"] = str(Path(config.CC_OUTPUT_ROOT) / "checkpoints" / ("model_best_exp4_cardiocontrast.pth" if name == "exp4_cardiocontrast" else "model_best_exp2_decoder_ca.pth" if name == "exp2_decoder_ca" else "model_best_exp3_contrastive_only.pth" if name == "exp3_contrastive" else "model_best_camus.pth"))
+            results.append(summary)
+            manifest_path = manifest_root / f"{name}_manifest.json"
+            manifest_path.write_text(json.dumps(summary, indent=2, sort_keys=True))
         print()
+    if results:
+        summary_path = manifest_root / "ablation_manifest.json"
+        summary_path.write_text(json.dumps(results, indent=2, sort_keys=True))
     return results
 
 
