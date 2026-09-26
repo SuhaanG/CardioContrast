@@ -3,6 +3,7 @@ import numpy as np
 import torch
 import torch.utils.data as data
 from PIL import Image
+from .dataset_camus import index_images, preprocess_grayscale_image
 
 STRUCTURE_PROMPTS = {
     1: "the left ventricular endocardium",
@@ -19,9 +20,9 @@ class CAMUSDatasetContrastive(data.Dataset):
     same-image-different-structure negative pairs.
     """
     def __init__(self, data_dir, bert_tokenizer="bert-base-uncased",
-                 image_transforms=None, max_tokens=20, split="train", use_language=True):
+                 img_size=352, max_tokens=20, split="train", use_language=True):
         self.data_dir         = data_dir
-        self.image_transforms = image_transforms
+        self.img_size         = img_size
         self.max_tokens       = max_tokens
         self.split            = split
         self.tokenizer = None
@@ -32,8 +33,6 @@ class CAMUSDatasetContrastive(data.Dataset):
         self.samples          = self._build_index()
 
     def _build_index(self):
-        from .dataset_camus import index_images
-
         seen = {}
         samples = []
         for record in index_images(self.data_dir, self.split):
@@ -75,22 +74,16 @@ class CAMUSDatasetContrastive(data.Dataset):
 
     def __getitem__(self, index):
         s     = self.samples[index]
-        image = self._load_nifti_2d(s["image_path"]).astype(np.float32)
-        if image.max() > 0:
-            image = image / image.max() * 255.0
-        image = image.astype(np.uint8)
-        image = np.stack([image, image, image], axis=-1)
-        img   = Image.fromarray(image).convert("RGB")
+        image = self._load_nifti_2d(s["image_path"])
+        img = preprocess_grayscale_image(image, self.img_size)
 
         full_mask = self._load_nifti_2d(s["mask_path"])
         annot     = np.zeros(full_mask.shape)
         annot[full_mask == s["label"]] = 1
-        annot = Image.fromarray(annot.astype(np.uint8), mode="P")
-
-        if self.image_transforms is not None:
-            img, target = self.image_transforms(img, annot)
-        else:
-            target = annot
+        annot = Image.fromarray(annot.astype(np.uint8)).resize(
+            (self.img_size, self.img_size), Image.NEAREST
+        )
+        target = torch.as_tensor(np.asarray(annot).copy(), dtype=torch.long)
 
         tokens, attn = self._tokenize(s["prompt"])
         image_idx    = torch.tensor(s["image_idx"], dtype=torch.int64)

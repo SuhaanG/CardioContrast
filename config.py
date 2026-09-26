@@ -48,6 +48,9 @@ LR = float(os.environ.get("CC_LR", DEFAULTS["learning_rate"]))
 WEIGHT_DECAY = float(os.environ.get("CC_WEIGHT_DECAY", DEFAULTS["weight_decay"]))
 SWIN_TYPE = os.environ.get("CC_SWIN_TYPE", DEFAULTS["swin_type"])
 WINDOW_SIZE = int(os.environ.get("CC_WINDOW_SIZE", DEFAULTS["window_size"]))
+if WINDOW_SIZE not in {7, 12}:
+    raise ValueError("CC_WINDOW_SIZE must be either 7 or 12")
+SPACING_UNIT = os.environ.get("CC_SPACING_UNIT", "").strip().lower()
 DECODE_WITH_LANG = bool(int(os.environ.get("CC_DECODE_WITH_LANG", int(DEFAULTS["decode_with_lang"]))))
 CONTRASTIVE_WEIGHT = float(os.environ.get("CC_CONTRASTIVE_WEIGHT", DEFAULTS["contrastive_weight"]))
 CONTRASTIVE_TAU = float(os.environ.get("CC_CONTRASTIVE_TAU", DEFAULTS["contrastive_tau"]))
@@ -89,6 +92,12 @@ def describe_runtime():
         "lr": LR,
         "weight_decay": WEIGHT_DECAY,
         "swin_type": SWIN_TYPE,
+        "window_size": WINDOW_SIZE,
+        "window12": WINDOW_SIZE == 12 or "window12" in PRETRAINED_SWIN.lower(),
+        "pretrained_swin": PRETRAINED_SWIN,
+        "spacing_unit": SPACING_UNIT or None,
+        "bert_path": BERT_PATH,
+        "bert_trainable_layers": BERT_TRAINABLE_LAYERS,
         "decode_with_lang": DECODE_WITH_LANG,
         "contrastive_weight": CONTRASTIVE_WEIGHT,
         "contrastive_tau": CONTRASTIVE_TAU,

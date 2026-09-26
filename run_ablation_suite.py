@@ -22,6 +22,7 @@ MANIFEST_ENV_KEYS = {
     "CC_WEIGHT_DECAY", "CC_SWIN_TYPE", "CC_WINDOW_SIZE",
     "CC_DECODE_WITH_LANG", "CC_CONTRASTIVE_WEIGHT", "CC_CONTRASTIVE_TAU",
     "CC_BERT_TRAINABLE_LAYERS", "CC_EMBED_TOKENS", "CC_IMAGES_PER_BATCH",
+    "CC_SPACING_UNIT",
 }
 
 
@@ -84,6 +85,10 @@ def run_experiments(experiment_order=None, dry_run=False):
         }
         summary["runtime"]["decode_with_lang"] = summary["decode_with_lang"]
         summary["runtime"]["contrastive_weight"] = summary["contrastive_weight"]
+        summary["runtime"]["window12"] = (
+            config.WINDOW_SIZE == 12 or "window12" in config.PRETRAINED_SWIN.lower()
+        )
+        summary["runtime"]["window_size"] = 12 if summary["runtime"]["window12"] else config.WINDOW_SIZE
         if dry_run:
             print(f"[dry-run] {name}: {' '.join(command)}")
             print(f"  decode_with_lang={summary['decode_with_lang']} contrastive_weight={summary['contrastive_weight']}")

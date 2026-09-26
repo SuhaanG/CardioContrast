@@ -14,11 +14,12 @@ if str(ROOT) not in sys.path:
 
 from data.prompts import CANONICAL, HELDOUT, STRUCTURES, TRAIN_BANK
 from data.splits import assert_disjoint, get_split_patients
-from data.dataset_camus import CAMUSDataset, index_images
+from data.dataset_camus import CAMUSDataset, index_images, preprocess_grayscale_image, spacing_to_mm
 from data.dataset_camus_contrastive import CAMUSDatasetContrastive
 from lib.contrastive import ContrastiveAnatomicalLoss, weighted_pool
 from lib.mask_predictor import DecoderCrossAttention, SimpleDecoding
 from lib._utils import LAVTOne
+from lib.paper_results import aggregate_patient_metrics
 from run_ablation_suite import build_env_for_preset, manifest_environment
 
 
@@ -55,6 +56,22 @@ def test_dataset_uses_patient_split_boundaries():
         assert {row["patient"] for row in train} == {"patient001", "patient400"}
         assert {row["patient"] for row in val} == {"patient401", "patient450"}
         assert {row["patient"] for row in test} == {"patient451", "patient500"}
+
+        contrastive_train = CAMUSDatasetContrastive(
+            str(data_dir), split="train", use_language=False
+        )
+        contrastive_val = CAMUSDatasetContrastive(
+            str(data_dir), split="val", use_language=False
+        )
+        contrastive_test = CAMUSDatasetContrastive(
+            str(data_dir), split="test", use_language=False
+        )
+        patient_names = lambda dataset: {
+            Path(sample["image_path"]).parent.name for sample in dataset.samples
+        }
+        assert patient_names(contrastive_train) == {"patient001", "patient400"}
+        assert patient_names(contrastive_val) == {"patient401", "patient450"}
+        assert patient_names(contrastive_test) == {"patient451", "patient500"}
 
 
 def test_ablation_manifest_is_filtered_and_presets_are_explicit():
@@ -103,6 +120,46 @@ def test_non_language_datasets_skip_tokenizer_loading():
         )
         assert baseline.tokenizer is None
         assert contrastive.tokenizer is None
+
+
+def test_patient_clustered_result_aggregation():
+    rows = [
+        {"patient": "p1", "structure_id": 1, "dice": 0.2, "iou": 0.1},
+        {"patient": "p1", "structure_id": 1, "dice": 0.4, "iou": 0.3},
+        {"patient": "p2", "structure_id": 1, "dice": 0.8, "iou": 0.7},
+        {"patient": "p3", "structure_id": 1, "dice": 0.9, "iou": 0.8},
+    ]
+    aggregated = aggregate_patient_metrics(rows, n_bootstrap=100, seed=7)
+    patient_rows = aggregated["patient_metrics"]
+    assert len(patient_rows) == 3
+    assert patient_rows[0]["n_frames"] == 2
+    assert abs(patient_rows[0]["dice"] - 0.3) < 1e-8
+    summary = aggregated["structure_summary"]["1"]
+    assert summary["n_patients"] == 3
+    assert summary["metrics"]["dice"]["n"] == 3
+    assert abs(summary["metrics"]["dice"]["estimate"] - (0.3 + 0.8 + 0.9) / 3) < 1e-8
+
+
+def test_nifti_spacing_conversion_requires_units():
+    assert spacing_to_mm((0.002, 0.003), "meter") == (2.0, 3.0)
+    assert spacing_to_mm((0.5, 0.6), "unknown", assumed_unit="mm") == (0.5, 0.6)
+    try:
+        spacing_to_mm((0.5, 0.6), "unknown")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("unknown spatial units must not be reported as millimeters")
+
+
+def test_shared_grayscale_preprocessing_uses_channelwise_normalization():
+    image = preprocess_grayscale_image(np.full((3, 4), 255, dtype=np.uint8), img_size=2)
+    expected = torch.tensor([
+        (1.0 - 0.485) / 0.229,
+        (1.0 - 0.456) / 0.224,
+        (1.0 - 0.406) / 0.225,
+    ])
+    assert image.shape == (3, 2, 2)
+    assert torch.allclose(image[:, 0, 0], expected, atol=1e-6)
 
 
 def test_contrastive_loss_and_pooling():
@@ -204,6 +261,9 @@ if __name__ == "__main__":
     test_ablation_manifest_is_filtered_and_presets_are_explicit()
     test_baseline_model_skips_text_encoder()
     test_non_language_datasets_skip_tokenizer_loading()
+    test_patient_clustered_result_aggregation()
+    test_nifti_spacing_conversion_requires_units()
+    test_shared_grayscale_preprocessing_uses_channelwise_normalization()
     test_contrastive_loss_and_pooling()
     test_decoder_gate_zero_matches_baseline()
     test_cross_attention_ignores_padding_tokens()

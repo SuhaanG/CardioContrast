@@ -25,7 +25,6 @@ import torch.utils.data
 from lib import segmentation
 from lib.contrastive import ContrastiveAnatomicalLoss
 from data.samplers import GroupedStructureSampler
-import transforms as T
 import config
 
 
@@ -39,7 +38,8 @@ def build_model_args():
     return SimpleNamespace(
         model="lavt_one", swin_type=config.SWIN_TYPE,
         decode_with_lang=config.DECODE_WITH_LANG,
-        mha="", fusion_drop=0.0, window12=True,
+        mha="", fusion_drop=0.0,
+        window12=config.WINDOW_SIZE == 12 or "window12" in config.PRETRAINED_SWIN.lower(),
         img_size=config.IMG_SIZE,
         bert_tokenizer=config.BERT_PATH,
         ck_bert=config.BERT_PATH,
@@ -50,14 +50,6 @@ def build_model_args():
 def get_decoder_hidden_size(swin_type):
     embed_dims = {"tiny": 96, "small": 96, "base": 128, "large": 192}
     return (embed_dims.get(swin_type, 128) * 8) // 2
-
-
-def get_transform(img_size):
-    return T.Compose([
-        T.Resize(img_size, img_size),
-        T.ToTensor(),
-        T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-    ])
 
 
 def criterion(output, target):
@@ -181,7 +173,9 @@ def main():
         "set. For the plain baseline, use train_camus.py instead.")
 
     model_args          = build_model_args()
-    transform           = get_transform(config.IMG_SIZE)
+    checkpoint_runtime = config.describe_runtime()
+    checkpoint_runtime["window12"] = model_args.window12
+    checkpoint_runtime["window_size"] = 12 if model_args.window12 else config.WINDOW_SIZE
     decoder_hidden_size = get_decoder_hidden_size(config.SWIN_TYPE)
     print("Decoder hidden size: {}".format(decoder_hidden_size), flush=True)
 
@@ -202,14 +196,14 @@ def main():
     train_ds = CAMUSDatasetContrastive(
         data_dir=config.CAMUS_DATA_DIR,
         bert_tokenizer=model_args.bert_tokenizer,
-        image_transforms=transform,
+        img_size=config.IMG_SIZE,
         split="train",
         use_language=config.DECODE_WITH_LANG,
     )
     val_ds = CAMUSDatasetContrastive(
         data_dir=config.CAMUS_DATA_DIR,
         bert_tokenizer=model_args.bert_tokenizer,
-        image_transforms=transform,
+        img_size=config.IMG_SIZE,
         split="val",
         use_language=config.DECODE_WITH_LANG,
     )
@@ -290,10 +284,13 @@ def main():
         if overall_IoU > best_oIoU:
             best_oIoU = overall_IoU
             if config.DECODE_WITH_LANG and config.CONTRASTIVE_WEIGHT > 0:
+                experiment_name = "exp4_cardiocontrast"
                 ckpt_name = "model_best_exp4_cardiocontrast.pth"
             elif config.DECODE_WITH_LANG:
+                experiment_name = "exp2_decoder_ca"
                 ckpt_name = "model_best_exp2_decoder_ca.pth"
             else:
+                experiment_name = "exp3_contrastive"
                 ckpt_name = "model_best_exp3_contrastive_only.pth"
             save_path = os.path.join(config.CHECKPOINT_DIR, ckpt_name)
             torch.save({
@@ -303,6 +300,10 @@ def main():
                 'decode_with_lang':   config.DECODE_WITH_LANG,
                 'contrastive_weight': config.CONTRASTIVE_WEIGHT,
                 'tau':                config.CONTRASTIVE_TAU,
+                'experiment':         experiment_name,
+                'selection_metric':   'validation_overall_iou_percent',
+                'best_validation_overall_iou_percent': best_oIoU,
+                'runtime':            checkpoint_runtime,
             }, save_path)
             print("Saved best model (Overall IoU {:.2f}) -> {}".format(
                 overall_IoU, save_path), flush=True)

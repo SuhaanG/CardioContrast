@@ -12,6 +12,18 @@ from .prompts import CANONICAL, HELDOUT, STRUCTURES, TRAIN_BANK
 FILENAME_RE = re.compile(r"(patient\d+)_(2CH|4CH)_(ED|ES)_gt\.nii(\.gz)?$")
 
 
+def spacing_to_mm(zooms, unit, assumed_unit=None):
+    if len(zooms) < 2 or any(not np.isfinite(value) or value <= 0 for value in zooms[:2]):
+        raise ValueError("NIfTI file has invalid in-plane pixel spacing")
+    if unit in {None, "", "unknown"}:
+        unit = assumed_unit
+    unit_to_mm = {"mm": 1.0, "meter": 1000.0, "micron": 0.001}
+    if unit not in unit_to_mm:
+        raise ValueError(f"Unsupported or missing NIfTI spatial unit: {unit!r}")
+    factor = unit_to_mm[unit]
+    return float(zooms[0] * factor), float(zooms[1] * factor)
+
+
 def index_images(data_dir, split):
     from .splits import get_split_patients
 
@@ -39,8 +51,22 @@ def index_images(data_dir, split):
     return records
 
 
+def preprocess_grayscale_image(image, img_size):
+    image = np.asarray(image, dtype=np.float32)
+    max_value = float(np.max(image)) if image.size else 0.0
+    if max_value > 0:
+        image = image / max_value * 255.0
+    image_rgb = np.repeat(image.astype(np.uint8)[:, :, None], 3, axis=2)
+    image_pil = Image.fromarray(image_rgb).resize((img_size, img_size), Image.BILINEAR)
+    image_arr = np.asarray(image_pil, dtype=np.float32) / 255.0
+    mean = np.asarray((0.485, 0.456, 0.406), dtype=np.float32).reshape(1, 1, 3)
+    std = np.asarray((0.229, 0.224, 0.225), dtype=np.float32).reshape(1, 1, 3)
+    normalized = ((image_arr - mean) / std).transpose(2, 0, 1).copy()
+    return torch.from_numpy(normalized)
+
+
 class CAMUSDataset(data.Dataset):
-    def __init__(self, data_dir, split="train", img_size=352, prompt_mode="fixed", eval_prompt_set="canonical", seed=42, epoch=0, use_language=True):
+    def __init__(self, data_dir, split="train", img_size=352, prompt_mode="fixed", eval_prompt_set="canonical", seed=42, epoch=0, use_language=True, bert_tokenizer="bert-base-uncased", spacing_unit=""):
         self.data_dir = data_dir
         self.split = split
         self.img_size = img_size
@@ -49,7 +75,10 @@ class CAMUSDataset(data.Dataset):
         self.seed = seed
         self.epoch = epoch
         self.use_language = use_language
+        self.bert_tokenizer = bert_tokenizer
+        self.spacing_unit = spacing_unit
         self.records = index_images(data_dir, split)
+        self._spacing_cache = {}
         self.samples = []
         for i, record in enumerate(self.records):
             for structure in sorted(STRUCTURES):
@@ -64,7 +93,7 @@ class CAMUSDataset(data.Dataset):
         try:
             from transformers import BertTokenizer
 
-            self.tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
+            self.tokenizer = BertTokenizer.from_pretrained(self.bert_tokenizer)
         except Exception:
             self.tokenizer = None
 
@@ -84,6 +113,20 @@ class CAMUSDataset(data.Dataset):
 
         arr = np.asarray(nib.load(path).get_fdata())
         return np.squeeze(arr).astype(np.float32)
+
+    def get_pixel_spacing(self, path, assumed_unit=None):
+        import nibabel as nib
+
+        if path in self._spacing_cache:
+            return self._spacing_cache[path]
+        header = nib.load(path).header
+        spacing = spacing_to_mm(
+            header.get_zooms(),
+            header.get_xyzt_units()[0],
+            assumed_unit=assumed_unit or self.spacing_unit,
+        )
+        self._spacing_cache[path] = spacing
+        return spacing
 
     def _resolve_prompt(self, structure, image_idx):
         if self.prompt_mode == "fixed":
@@ -108,22 +151,17 @@ class CAMUSDataset(data.Dataset):
         prompt = self._resolve_prompt(structure, image_idx)
 
         image = self._load_nifti_2d(record["image_path"])
+        image_tensor = preprocess_grayscale_image(image, self.img_size)
         mask = self._load_nifti_2d(record["mask_path"])
         foreground = np.zeros_like(mask, dtype=np.uint8)
         foreground[mask == structure] = 1
-
-        max_value = float(np.max(image)) if np.max(image) > 0 else 1.0
-        image_norm = image / max_value
-        image_pil = Image.fromarray(np.repeat(np.asarray(Image.fromarray(image_norm).resize((self.img_size, self.img_size), Image.BILINEAR))[:, :, None], 3, axis=2))
-        image_arr = np.asarray(image_pil).transpose(2, 0, 1).astype(np.float32)
-        image_arr = (image_arr - 0.485) / 0.229
 
         target = np.asarray(Image.fromarray(foreground.astype(np.uint8)).resize((self.img_size, self.img_size), Image.NEAREST), dtype=np.float32)
         union = (mask > 0).astype(np.float32)
 
         input_ids, attn_mask = self._encode_prompt(prompt)
         return {
-            "image": torch.from_numpy(image_arr),
+            "image": image_tensor,
             "target": torch.from_numpy(target),
             "union": torch.from_numpy(union),
             "input_ids": input_ids,
@@ -143,7 +181,7 @@ class CAMUSDataset(data.Dataset):
     def load_full_res(self, image_idx):
         record = self.records[image_idx]
         mask = self._load_nifti_2d(record["mask_path"])
-        spacing = np.array([1.0, 1.0, 1.0], dtype=np.float32)
+        spacing = np.asarray(self.get_pixel_spacing(record["mask_path"]), dtype=np.float32)
         return mask, spacing
 
     def image_groups(self):

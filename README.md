@@ -20,6 +20,7 @@ This repository is structured for publication-quality experimentation and reprod
 - `config.py` — environment-driven configuration, presets, and experiment metadata
 - `data/` — dataset indexing, prompt banks, and patient split logic
 - `lib/` — model blocks, contrastive loss, metrics, and decoder utilities
+- `evaluate_camus.py` — final held-out test evaluation and paper result export
 - `tests/test_core.py` — lightweight regression suite for protocol and model invariants
 - `run_ablation_suite.py` — reproducible ablation runner across the main experimental presets
 - `report_experiments.py` — summary script to aggregate experiment logs into a paper-friendly report
@@ -59,6 +60,7 @@ The project also supports these settings in `config.py`:
 - `PRETRAINED_SWIN`
 - `BERT_PATH`
 - `CC_OUTPUT_ROOT`
+- `CC_SPACING_UNIT` — only needed when NIfTI headers do not declare spatial units; set this only after verifying the source data units (`mm`, `meter`, or `micron`)
 
 ## Data protocol
 
@@ -124,7 +126,13 @@ and to collect a summary of logged results:
 python report_experiments.py
 ```
 
-The runner records the seed, runtime configuration, selected non-secret environment settings, and split policy in JSON manifests under `CC_OUTPUT_ROOT/paper`. Its test cohort remains held out; a separate final test evaluation is required before reporting benchmark results.
+The runner records the seed, runtime configuration, selected non-secret environment settings, and split policy in JSON manifests under `CC_OUTPUT_ROOT/paper`. After selecting a checkpoint using validation only, run final held-out evaluation:
+
+```bash
+python evaluate_camus.py --experiment exp4_cardiocontrast --checkpoint /path/to/selected_checkpoint.pth
+```
+
+The evaluator always uses the test split and writes frame-level and patient-level CSV tables plus a JSON summary with patient-clustered bootstrap confidence intervals. Its metrics use original-resolution masks and NIfTI in-plane spacing converted to millimeters. If headers have unknown units, evaluation stops unless `CC_SPACING_UNIT` is explicitly set. Do not use these test results for further model or hyperparameter selection.
 
 ## Citation and reuse
 

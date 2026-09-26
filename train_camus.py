@@ -31,7 +31,7 @@ def build_model_args():
         decode_with_lang=False,
         mha="",
         fusion_drop=0.0,
-        window12=True,
+        window12=config.WINDOW_SIZE == 12 or "window12" in config.PRETRAINED_SWIN.lower(),
         img_size=config.IMG_SIZE,
         bert_tokenizer=config.BERT_PATH,
         ck_bert=config.BERT_PATH,
@@ -156,6 +156,13 @@ def main():
     assert torch.cuda.is_available(), "CUDA GPU required. Run on the lab machine."
 
     model_args = build_model_args()
+    checkpoint_runtime = config.describe_runtime()
+    checkpoint_runtime.update({
+        "decode_with_lang": False,
+        "contrastive_weight": 0.0,
+        "window12": model_args.window12,
+        "window_size": 12 if model_args.window12 else config.WINDOW_SIZE,
+    })
     from data.dataset_camus import CAMUSDataset
     train_ds = CAMUSDataset(
         data_dir=config.CAMUS_DATA_DIR,
@@ -236,7 +243,16 @@ def main():
         if overall_IoU > best_oIoU:
             best_oIoU = overall_IoU
             save_path = os.path.join(config.CHECKPOINT_DIR, "model_best_camus.pth")
-            torch.save({'model': raw_model.state_dict(), 'epoch': epoch}, save_path)
+            torch.save({
+                "model": raw_model.state_dict(),
+                "epoch": epoch,
+                "experiment": "exp1_baseline",
+                "decode_with_lang": False,
+                "contrastive_weight": 0.0,
+                "selection_metric": "validation_overall_iou_percent",
+                "best_validation_overall_iou_percent": best_oIoU,
+                "runtime": checkpoint_runtime,
+            }, save_path)
             print("Saved best model (Overall IoU {:.2f}) -> {}".format(
                 overall_IoU, save_path), flush=True)
 

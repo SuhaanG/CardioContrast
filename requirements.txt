@@ -5,6 +5,7 @@
 
 torch
 torchvision
+timm>=1.0,<2
 transformers>=4.40,<5
 nibabel
 numpy
