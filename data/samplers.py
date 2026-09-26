@@ -26,7 +26,8 @@ class GroupedStructureSampler(Sampler):
         shuffle:    shuffle image order each epoch
     """
     def __init__(self, train_ds, batch_size, shuffle=True):
-        assert batch_size >= 2, "batch_size must be >= 2"
+        if batch_size < 3:
+            raise ValueError("batch_size must be >= 3 to include every structure")
         self.batch_size = batch_size
         self.shuffle    = shuffle
 

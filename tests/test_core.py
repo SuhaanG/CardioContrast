@@ -16,6 +16,7 @@ from data.prompts import CANONICAL, HELDOUT, STRUCTURES, TRAIN_BANK
 from data.splits import assert_disjoint, get_split_patients
 from data.dataset_camus import CAMUSDataset, index_images, preprocess_grayscale_image, spacing_to_mm
 from data.dataset_camus_contrastive import CAMUSDatasetContrastive
+from data.samplers import GroupedStructureSampler
 from lib.contrastive import ContrastiveAnatomicalLoss, weighted_pool
 from lib.mask_predictor import DecoderCrossAttention, SimpleDecoding
 from lib._utils import LAVTOne
@@ -162,6 +163,43 @@ def test_shared_grayscale_preprocessing_uses_channelwise_normalization():
     assert torch.allclose(image[:, 0, 0], expected, atol=1e-6)
 
 
+def test_grouped_sampler_keeps_structure_triplets_together():
+    class SampleSet:
+        def __init__(self):
+            self.samples = [
+                {"image_idx": image_id, "label": structure_id}
+                for image_id in range(2)
+                for structure_id in (1, 2, 3)
+            ]
+
+        def __len__(self):
+            return len(self.samples)
+
+    dataset = SampleSet()
+    sampler = GroupedStructureSampler(dataset, batch_size=3, shuffle=False)
+    sampled_indices = list(sampler)
+    for offset in range(0, len(sampled_indices), 3):
+        batch = [dataset.samples[index] for index in sampled_indices[offset:offset + 3]]
+        assert len({sample["image_idx"] for sample in batch}) == 1
+        assert {sample["label"] for sample in batch} == {1, 2, 3}
+
+    larger_sampler = GroupedStructureSampler(dataset, batch_size=4, shuffle=False)
+    larger_indices = list(larger_sampler)
+    for offset in range(0, len(larger_indices), 4):
+        batch = [dataset.samples[index] for index in larger_indices[offset:offset + 4]]
+        assert any(
+            {sample["label"] for sample in batch if sample["image_idx"] == image_id} == {1, 2, 3}
+            for image_id in range(2)
+        )
+
+    try:
+        GroupedStructureSampler(dataset, batch_size=2, shuffle=False)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("contrastive sampler must reject incomplete structure batches")
+
+
 def test_contrastive_loss_and_pooling():
     feat = torch.randn(3, 4, 5, 5)
     weights = torch.ones(3, 1, 5, 5)
@@ -264,6 +302,7 @@ if __name__ == "__main__":
     test_patient_clustered_result_aggregation()
     test_nifti_spacing_conversion_requires_units()
     test_shared_grayscale_preprocessing_uses_channelwise_normalization()
+    test_grouped_sampler_keeps_structure_triplets_together()
     test_contrastive_loss_and_pooling()
     test_decoder_gate_zero_matches_baseline()
     test_cross_attention_ignores_padding_tokens()

@@ -68,6 +68,7 @@ The codebase uses a patient-aware protocol for CAMUS.
 
 - Official `database_split` subgroup files are used when present. Otherwise, the explicit fallback is patients 001–400 for training, 401–450 for validation, and 451–500 for test.
 - Training entry points construct separate train and validation datasets from this shared split policy; the test cohort is not used for model selection.
+- Contrastive batches must contain at least three samples so the grouped sampler can include all three cardiac structures from one image.
 - Prompt sets are separated into canonical and held-out banks to reduce phrase leakage.
 - Split and prompt logic are enforced in the `data/` package and validated by the core test suite.
 
@@ -133,6 +134,8 @@ python evaluate_camus.py --experiment exp4_cardiocontrast --checkpoint /path/to/
 ```
 
 The evaluator always uses the test split and writes frame-level and patient-level CSV tables plus a JSON summary with patient-clustered bootstrap confidence intervals. Its metrics use original-resolution masks and NIfTI in-plane spacing converted to millimeters. If headers have unknown units, evaluation stops unless `CC_SPACING_UNIT` is explicitly set. Do not use these test results for further model or hyperparameter selection.
+
+Training seeds Python, NumPy, and PyTorch and enables deterministic cuDNN behavior. Bitwise-identical results are not guaranteed across different GPUs, drivers, or library versions.
 
 ## Citation and reuse
 
