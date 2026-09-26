@@ -101,6 +101,19 @@ def test_binary_metrics_known_square_and_empty():
     assert metrics_empty["empty_case"] is True
 
 
+def test_per_structure_metrics_summary():
+    from lib.metrics import per_structure_metrics
+
+    pred = np.zeros((10, 10), dtype=np.uint8)
+    gt = np.zeros((10, 10), dtype=np.uint8)
+    pred[2:8, 2:8] = 1
+    gt[2:8, 2:8] = 1
+    metrics = per_structure_metrics(pred, gt, structure_id=1)
+    assert metrics["dice"] > 0.9
+    assert metrics["structure_id"] == 1
+    assert metrics["empty_case"] is False
+
+
 def test_simpson_ellipse_volume_reasonable():
     from lib.metrics import simpson_volume, ejection_fraction
 

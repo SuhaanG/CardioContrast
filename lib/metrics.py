@@ -88,4 +88,34 @@ def agreement(x, y):
     return {"n": n, "r": float(r), "bias": bias, "mae": mae, "loa": loa}
 
 
-__all__ = ["binary_metrics", "leakage", "simpson_volume", "ejection_fraction", "agreement"]
+def per_structure_metrics(pred, gt, structure_id=1, spacing=(1.0, 1.0)):
+    pred = np.asarray(pred, dtype=np.uint8)
+    gt = np.asarray(gt, dtype=np.uint8)
+    pred_area = (pred > 0).sum()
+    gt_area = (gt > 0).sum()
+    empty_case = bool((pred_area == 0) or (gt_area == 0))
+
+    if empty_case:
+        return {
+            "structure_id": int(structure_id),
+            "dice": 1.0 if pred_area == 0 and gt_area == 0 else 0.0,
+            "iou": 1.0 if pred_area == 0 and gt_area == 0 else 0.0,
+            "hd95": np.nan,
+            "hd": np.nan,
+            "mad": np.nan,
+            "empty_case": empty_case,
+        }
+
+    base = binary_metrics(pred, gt, spacing=spacing)
+    return {
+        "structure_id": int(structure_id),
+        "dice": float(base["dice"]),
+        "iou": float(base["iou"]),
+        "hd95": float(base["hd95"]),
+        "hd": float(base["hd"]),
+        "mad": float(base["mad"]),
+        "empty_case": False,
+    }
+
+
+__all__ = ["binary_metrics", "leakage", "simpson_volume", "ejection_fraction", "agreement", "per_structure_metrics"]
