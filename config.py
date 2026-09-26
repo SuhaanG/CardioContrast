@@ -1,6 +1,8 @@
 import os
 import subprocess
 
+import torch
+
 CAMUS_DATA_DIR = os.environ.get("CAMUS_DATA_DIR", os.path.join("data", "CAMUS"))
 ECHONET_DATA_DIR = os.environ.get("ECHONET_DATA_DIR", os.path.join("data", "EchoNet"))
 PRETRAINED_SWIN = os.environ.get("PRETRAINED_SWIN", "")
@@ -37,6 +39,65 @@ PRESETS = {
     "exp7_union_pool": {"decode_with_lang": True, "contrastive_weight": 0.1, "pool_region": "union", "exp_name": "exp7_union_pool"},
 }
 
+SEED = int(os.environ.get("CC_SEED", DEFAULTS["seed"]))
+EPOCHS = int(os.environ.get("CC_EPOCHS", DEFAULTS["epochs"]))
+IMG_SIZE = int(os.environ.get("CC_IMG_SIZE", DEFAULTS["img_size"]))
+BATCH_SIZE = int(os.environ.get("CC_BATCH_SIZE", DEFAULTS["batch_size"]))
+GRADIENT_ACCUMULATION_STEPS = int(os.environ.get("CC_GRAD_ACCUM_STEPS", DEFAULTS["grad_accum_steps"]))
+LR = float(os.environ.get("CC_LR", DEFAULTS["learning_rate"]))
+WEIGHT_DECAY = float(os.environ.get("CC_WEIGHT_DECAY", DEFAULTS["weight_decay"]))
+SWIN_TYPE = os.environ.get("CC_SWIN_TYPE", DEFAULTS["swin_type"])
+WINDOW_SIZE = int(os.environ.get("CC_WINDOW_SIZE", DEFAULTS["window_size"]))
+DECODE_WITH_LANG = bool(int(os.environ.get("CC_DECODE_WITH_LANG", int(DEFAULTS["decode_with_lang"]))))
+CONTRASTIVE_WEIGHT = float(os.environ.get("CC_CONTRASTIVE_WEIGHT", DEFAULTS["contrastive_weight"]))
+CONTRASTIVE_TAU = float(os.environ.get("CC_CONTRASTIVE_TAU", DEFAULTS["contrastive_tau"]))
+BERT_TRAINABLE_LAYERS = int(os.environ.get("CC_BERT_TRAINABLE_LAYERS", DEFAULTS["bert_trainable_layers"]))
+EMBED_TOKENS = int(os.environ.get("CC_EMBED_TOKENS", DEFAULTS["embed_tokens"]))
+IMAGES_PER_BATCH = int(os.environ.get("CC_IMAGES_PER_BATCH", DEFAULTS["images_per_batch"]))
+CHECKPOINT_DIR = os.environ.get("CC_CHECKPOINT_DIR", os.path.join(CC_OUTPUT_ROOT, "checkpoints"))
+GPU_IDS = []
+if os.environ.get("CUDA_VISIBLE_DEVICES"):
+    GPU_IDS = [int(x) for x in os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(",") if x.strip()]
+if not GPU_IDS:
+    GPU_IDS = [0] if torch.cuda.is_available() else []
+
+
+def apply_preset(name: str):
+    global DECODE_WITH_LANG, CONTRASTIVE_WEIGHT
+    if name not in PRESETS:
+        raise KeyError(f"Unknown preset '{name}'. Available: {sorted(PRESETS)}")
+    preset = PRESETS[name]
+    for key, value in preset.items():
+        if key == "decode_with_lang":
+            DECODE_WITH_LANG = bool(value)
+        elif key == "contrastive_weight":
+            CONTRASTIVE_WEIGHT = float(value)
+        elif key == "exp_name":
+            continue
+        else:
+            globals()[key.upper()] = value
+    return preset
+
+
+def describe_runtime():
+    return {
+        "seed": SEED,
+        "epochs": EPOCHS,
+        "img_size": IMG_SIZE,
+        "batch_size": BATCH_SIZE,
+        "grad_accum_steps": GRADIENT_ACCUMULATION_STEPS,
+        "lr": LR,
+        "weight_decay": WEIGHT_DECAY,
+        "swin_type": SWIN_TYPE,
+        "decode_with_lang": DECODE_WITH_LANG,
+        "contrastive_weight": CONTRASTIVE_WEIGHT,
+        "contrastive_tau": CONTRASTIVE_TAU,
+        "checkpoint_dir": CHECKPOINT_DIR,
+        "camus_data_dir": CAMUS_DATA_DIR,
+        "device": DEVICE,
+        "git_hash": git_hash(),
+    }
+
 
 def git_hash():
     try:
@@ -47,12 +108,14 @@ def git_hash():
 
 def initialize_environment():
     os.makedirs(CC_OUTPUT_ROOT, exist_ok=True)
+    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
     return {
         "CAMUS_DATA_DIR": CAMUS_DATA_DIR,
         "ECHONET_DATA_DIR": ECHONET_DATA_DIR,
         "PRETRAINED_SWIN": PRETRAINED_SWIN,
         "BERT_PATH": BERT_PATH,
         "CC_OUTPUT_ROOT": CC_OUTPUT_ROOT,
+        "CHECKPOINT_DIR": CHECKPOINT_DIR,
         "device": DEVICE,
         "git_hash": git_hash(),
     }

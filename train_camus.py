@@ -185,6 +185,8 @@ def evaluate(model, data_loader):
 
 def main():
     config.initialize_environment()
+    runtime = config.describe_runtime()
+    print("[config] Runtime summary: {}".format(runtime), flush=True)
     set_seed(config.SEED)
 
     assert torch.cuda.is_available(), "CUDA GPU required. Run on the lab machine."

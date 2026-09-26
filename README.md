@@ -21,6 +21,8 @@ This repository is structured for publication-quality experimentation and reprod
 - `data/` — dataset indexing, prompt banks, and patient split logic
 - `lib/` — model blocks, contrastive loss, metrics, and decoder utilities
 - `tests/test_core.py` — lightweight regression suite for protocol and model invariants
+- `run_ablation_suite.py` — reproducible ablation runner across the main experimental presets
+- `report_experiments.py` — summary script to aggregate experiment logs into a paper-friendly report
 - `train_camus.py` — CAMUS training entry point
 - `train_camus_contrastive.py` — contrastive and language-conditioned experiments
 
@@ -94,6 +96,18 @@ or
 
 ```bash
 python train_camus_contrastive.py
+```
+
+For a reproducible paper-style ablation sweep, use the built-in runner:
+
+```bash
+python run_ablation_suite.py --run
+```
+
+and to collect a summary of logged results:
+
+```bash
+python report_experiments.py
 ```
 
 The repository includes experiment preset definitions for baseline and contrastive variants in `config.PRESETS`.
