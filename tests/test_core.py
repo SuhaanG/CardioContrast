@@ -2,6 +2,7 @@ import math
 import os
 import sys
 import tempfile
+from types import SimpleNamespace
 from pathlib import Path
 
 import numpy as np
@@ -13,8 +14,12 @@ if str(ROOT) not in sys.path:
 
 from data.prompts import CANONICAL, HELDOUT, STRUCTURES, TRAIN_BANK
 from data.splits import assert_disjoint, get_split_patients
+from data.dataset_camus import CAMUSDataset, index_images
+from data.dataset_camus_contrastive import CAMUSDatasetContrastive
 from lib.contrastive import ContrastiveAnatomicalLoss, weighted_pool
 from lib.mask_predictor import DecoderCrossAttention, SimpleDecoding
+from lib._utils import LAVTOne
+from run_ablation_suite import build_env_for_preset, manifest_environment
 
 
 def test_split_and_prompts():
@@ -31,6 +36,73 @@ def test_split_and_prompts():
         heldout_prompts = {prompt for prompts in HELDOUT.values() for prompt in prompts}
         overlap = train_prompts & heldout_prompts
         assert not overlap, f"prompt overlap found: {overlap}"
+
+
+def test_dataset_uses_patient_split_boundaries():
+    with tempfile.TemporaryDirectory() as tmp:
+        data_dir = Path(tmp) / "database_nifti"
+        for patient_id in (1, 400, 401, 450, 451, 500):
+            patient = f"patient{patient_id:03d}"
+            patient_dir = data_dir / patient
+            patient_dir.mkdir(parents=True)
+            image_name = f"{patient}_2CH_ED.nii.gz"
+            (patient_dir / image_name).touch()
+            (patient_dir / image_name.replace(".nii.gz", "_gt.nii.gz")).touch()
+
+        train = index_images(str(data_dir), "train")
+        val = index_images(str(data_dir), "val")
+        test = index_images(str(data_dir), "test")
+        assert {row["patient"] for row in train} == {"patient001", "patient400"}
+        assert {row["patient"] for row in val} == {"patient401", "patient450"}
+        assert {row["patient"] for row in test} == {"patient451", "patient500"}
+
+
+def test_ablation_manifest_is_filtered_and_presets_are_explicit():
+    safe = manifest_environment({
+        "CC_SEED": "42",
+        "CC_DECODE_WITH_LANG": "1",
+        "AWS_SECRET_ACCESS_KEY": "do-not-record",
+    })
+    assert safe == {"CC_DECODE_WITH_LANG": "1", "CC_SEED": "42"}
+    try:
+        build_env_for_preset("exp5_class_embedding")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("unsupported preset must not silently run as another experiment")
+
+
+def test_baseline_model_skips_text_encoder():
+    class IdentityBackbone(torch.nn.Module):
+        def forward(self, image):
+            return image, image, image, image
+
+    class TwoClassHead(torch.nn.Module):
+        def forward(self, x_c4, x_c3, x_c2, x_c1, **kwargs):
+            return torch.cat((x_c4, x_c4), dim=1), x_c4
+
+    model = LAVTOne(
+        IdentityBackbone(),
+        TwoClassHead(),
+        SimpleNamespace(decode_with_lang=False),
+    )
+    image = torch.randn(2, 1, 8, 8)
+    output = model(image, text=None, l_mask=None)
+    assert model.text_encoder is None
+    assert output.shape == (2, 2, 8, 8)
+
+
+def test_non_language_datasets_skip_tokenizer_loading():
+    with tempfile.TemporaryDirectory() as tmp:
+        data_dir = str(Path(tmp) / "database_nifti")
+        baseline = CAMUSDataset(data_dir, split="train", use_language=False)
+        contrastive = CAMUSDatasetContrastive(
+            data_dir,
+            split="train",
+            use_language=False,
+        )
+        assert baseline.tokenizer is None
+        assert contrastive.tokenizer is None
 
 
 def test_contrastive_loss_and_pooling():
@@ -128,6 +200,10 @@ def test_simpson_ellipse_volume_reasonable():
 
 if __name__ == "__main__":
     test_split_and_prompts()
+    test_dataset_uses_patient_split_boundaries()
+    test_ablation_manifest_is_filtered_and_presets_are_explicit()
+    test_baseline_model_skips_text_encoder()
+    test_non_language_datasets_skip_tokenizer_loading()
     test_contrastive_loss_and_pooling()
     test_decoder_gate_zero_matches_baseline()
     test_cross_attention_ignores_padding_tokens()

@@ -1,11 +1,8 @@
 import os
-import glob
 import numpy as np
-import nibabel as nib
 import torch
 import torch.utils.data as data
 from PIL import Image
-from transformers import BertTokenizer
 
 STRUCTURE_PROMPTS = {
     1: "the left ventricular endocardium",
@@ -22,24 +19,26 @@ class CAMUSDatasetContrastive(data.Dataset):
     same-image-different-structure negative pairs.
     """
     def __init__(self, data_dir, bert_tokenizer="bert-base-uncased",
-                 image_transforms=None, max_tokens=20):
+                 image_transforms=None, max_tokens=20, split="train", use_language=True):
         self.data_dir         = data_dir
         self.image_transforms = image_transforms
         self.max_tokens       = max_tokens
-        self.tokenizer = BertTokenizer.from_pretrained(bert_tokenizer)
+        self.split            = split
+        self.tokenizer = None
+        if use_language:
+            from transformers import BertTokenizer
+
+            self.tokenizer = BertTokenizer.from_pretrained(bert_tokenizer)
         self.samples          = self._build_index()
 
     def _build_index(self):
-        mask_paths = sorted(glob.glob(
-            os.path.join(self.data_dir, "patient*", "*_gt.nii.gz")))
+        from .dataset_camus import index_images
+
         seen = {}
         samples = []
-        for mask_path in mask_paths:
-            if "half_sequence" in mask_path:
-                continue
-            image_path = mask_path.replace("_gt.nii.gz", ".nii.gz")
-            if not os.path.exists(image_path):
-                continue
+        for record in index_images(self.data_dir, self.split):
+            image_path = record["image_path"]
+            mask_path = record["mask_path"]
             if image_path not in seen:
                 seen[image_path] = len(seen)
             img_idx = seen[image_path]
@@ -57,9 +56,14 @@ class CAMUSDatasetContrastive(data.Dataset):
         return len(self.samples)
 
     def _load_nifti_2d(self, path):
+        import nibabel as nib
+
         return np.squeeze(nib.load(path).get_fdata())
 
     def _tokenize(self, sentence):
+        if self.tokenizer is None:
+            return (torch.zeros(1, self.max_tokens, dtype=torch.long),
+                    torch.zeros(1, self.max_tokens, dtype=torch.long))
         attention_mask   = [0] * self.max_tokens
         padded_input_ids = [0] * self.max_tokens
         input_ids = self.tokenizer.encode(text=sentence, add_special_tokens=True)

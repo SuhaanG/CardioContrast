@@ -11,15 +11,10 @@
 #   python train_camus_contrastive.py 2>&1 | tee logs/exp3_contrastive_only.txt
 #   python train_camus_contrastive.py 2>&1 | tee logs/exp4_cardiocontrast.txt
 
-from transformers import BertModel, BertTokenizer
-_ = BertTokenizer.from_pretrained("bert-base-uncased")
-
 import os
 import time
 import datetime
 import gc
-import operator
-from functools import reduce
 from types import SimpleNamespace
 
 import numpy as np
@@ -43,10 +38,12 @@ def set_seed(seed):
 def build_model_args():
     return SimpleNamespace(
         model="lavt_one", swin_type=config.SWIN_TYPE,
+        decode_with_lang=config.DECODE_WITH_LANG,
         mha="", fusion_drop=0.0, window12=True,
         img_size=config.IMG_SIZE,
         bert_tokenizer=config.BERT_PATH,
         ck_bert=config.BERT_PATH,
+        bert_trainable_layers=config.BERT_TRAINABLE_LAYERS,
     )
 
 
@@ -79,36 +76,6 @@ def IoU(pred, gt):
     if intersection == 0 or union == 0:
         return 0, intersection, union
     return float(intersection) / float(union), intersection, union
-
-
-def official_camus_split(full_dataset):
-    """
-    Use the official CAMUS train/val split: patient001-patient450 train,
-    patient451-patient500 val. This matches all published CAMUS benchmarks
-    and allows direct comparison to prior work.
-    """
-    def patient_num(sample):
-        folder = os.path.basename(os.path.dirname(sample["image_path"]))
-        digits = ''.join(filter(str.isdigit, folder))
-        return int(digits) if digits else 0
-
-    train_indices = [
-        i for i, s in enumerate(full_dataset.samples)
-        if patient_num(s) <= 450
-    ]
-    val_indices = [
-        i for i, s in enumerate(full_dataset.samples)
-        if patient_num(s) > 450
-    ]
-
-    train_ds = torch.utils.data.Subset(full_dataset, train_indices)
-    val_ds   = torch.utils.data.Subset(full_dataset, val_indices)
-
-    print("Official CAMUS split — train patients: <=450  val patients: 451-500", flush=True)
-    print("Samples  — train: {}  val: {}".format(
-        len(train_indices), len(val_indices)), flush=True)
-
-    return train_ds, val_ds, train_indices
 
 
 def train_one_epoch(model, contrastive_module, optimizer, data_loader,
@@ -232,16 +199,23 @@ def main():
         print("Mode: Experiment 3 - Contrastive loss only", flush=True)
 
     from data.dataset_camus_contrastive import CAMUSDatasetContrastive
-    full_dataset = CAMUSDatasetContrastive(
+    train_ds = CAMUSDatasetContrastive(
         data_dir=config.CAMUS_DATA_DIR,
         bert_tokenizer=model_args.bert_tokenizer,
         image_transforms=transform,
+        split="train",
+        use_language=config.DECODE_WITH_LANG,
     )
-    print("Total CAMUS examples: {}".format(len(full_dataset)), flush=True)
-    if len(full_dataset) == 0:
-        raise ValueError("No CAMUS samples found. Check CAMUS_DATA_DIR in config.py.")
-
-    train_ds, val_ds, _ = official_camus_split(full_dataset)
+    val_ds = CAMUSDatasetContrastive(
+        data_dir=config.CAMUS_DATA_DIR,
+        bert_tokenizer=model_args.bert_tokenizer,
+        image_transforms=transform,
+        split="val",
+        use_language=config.DECODE_WITH_LANG,
+    )
+    print("CAMUS examples — train: {}  val: {}".format(len(train_ds), len(val_ds)), flush=True)
+    if len(train_ds) == 0 or len(val_ds) == 0:
+        raise ValueError("CAMUS train or validation split is empty. Check CAMUS_DATA_DIR and database_split files.")
 
     train_sampler = GroupedStructureSampler(
         train_ds=train_ds,
@@ -287,11 +261,12 @@ def main():
         {'params': backbone_no_decay, 'weight_decay': 0.0},
         {'params': backbone_decay},
         {"params": [p for p in raw_model.classifier.parameters() if p.requires_grad]},
-        {"params": reduce(operator.concat,
-                          [[p for p in raw_model.text_encoder.encoder.layer[i].parameters()
-                            if p.requires_grad] for i in range(10)])},
         {"params": contrastive_module.parameters()},
     ]
+    if raw_model.text_encoder is not None:
+        text_parameters = [p for p in raw_model.text_encoder.parameters() if p.requires_grad]
+        if text_parameters:
+            params_to_optimize.append({"params": text_parameters})
 
     optimizer = torch.optim.AdamW(
         params_to_optimize, lr=config.LR, weight_decay=config.WEIGHT_DECAY)

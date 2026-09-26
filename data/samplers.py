@@ -30,10 +30,12 @@ class GroupedStructureSampler(Sampler):
         self.batch_size = batch_size
         self.shuffle    = shuffle
 
-        # Group positional indices (0..len(train_ds)-1) by image_idx
+        # Group positional indices (0..len(train_ds)-1) by image_idx.
+        dataset = getattr(train_ds, "dataset", train_ds)
+        source_indices = getattr(train_ds, "indices", range(len(train_ds)))
         self.groups = defaultdict(list)
-        for pos, full_idx in enumerate(train_ds.indices):
-            sample = train_ds.dataset.samples[full_idx]
+        for pos, full_idx in enumerate(source_indices):
+            sample = dataset.samples[full_idx]
             self.groups[sample["image_idx"]].append(pos)
 
         self.image_keys  = list(self.groups.keys())

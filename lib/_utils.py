@@ -105,13 +105,33 @@ class LAVTOne(nn.Module):
         self.backbone = backbone
         self.classifier = classifier
         self.args = args
+        self.text_encoder = None
+        if getattr(args, "decode_with_lang", True):
+            from transformers import BertModel
+
+            self.text_encoder = BertModel.from_pretrained(
+                args.ck_bert if hasattr(args, "ck_bert") else "bert-base-uncased",
+                add_pooling_layer=False,
+            )
+            trainable_layers = min(
+                max(0, int(getattr(args, "bert_trainable_layers", 10))),
+                len(self.text_encoder.encoder.layer),
+            )
+            for parameter in self.text_encoder.embeddings.parameters():
+                parameter.requires_grad = False
+            frozen_layers = len(self.text_encoder.encoder.layer) - trainable_layers
+            for layer in self.text_encoder.encoder.layer[:frozen_layers]:
+                layer.requires_grad_(False)
 
     def forward(self, x, text, l_mask, return_features=False, decode_with_lang=False):
-        from transformers import BertModel
-        bert = BertModel.from_pretrained(self.args.ck_bert if hasattr(self.args, 'ck_bert') else 'bert-base-uncased')
-        bert.pooler = None
-        l_feats = bert(text, attention_mask=l_mask)[0].permute(0, 2, 1)
-        l_mask = l_mask.unsqueeze(-1)
+        if decode_with_lang:
+            if self.text_encoder is None:
+                raise RuntimeError("Language decoding is enabled but no text encoder was initialized.")
+            l_feats = self.text_encoder(input_ids=text, attention_mask=l_mask).last_hidden_state.permute(0, 2, 1)
+            l_mask = l_mask.unsqueeze(-1)
+        else:
+            l_feats = None
+            l_mask = None
         feats = self.backbone(x)
         x_c1, x_c2, x_c3, x_c4 = feats
         logits, features = self.classifier(x_c4, x_c3, x_c2, x_c1, lang_feat=l_feats if decode_with_lang else None, lang_mask=l_mask if decode_with_lang else None, return_features=True)

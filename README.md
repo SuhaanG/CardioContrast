@@ -64,9 +64,12 @@ The project also supports these settings in `config.py`:
 
 The codebase uses a patient-aware protocol for CAMUS.
 
-- Train/val/test patients are defined at the patient level, not the image level.
+- Official `database_split` subgroup files are used when present. Otherwise, the explicit fallback is patients 001–400 for training, 401–450 for validation, and 451–500 for test.
+- Training entry points construct separate train and validation datasets from this shared split policy; the test cohort is not used for model selection.
 - Prompt sets are separated into canonical and held-out banks to reduce phrase leakage.
 - Split and prompt logic are enforced in the `data/` package and validated by the core test suite.
+
+The ablation runner supports the four implemented conditions (`exp1_baseline`, `exp2_decoder_ca`, `exp3_contrastive`, and `exp4_cardiocontrast`). Other entries in `config.PRESETS` are experimental ideas and are rejected by the runner until their behavior is implemented end to end.
 
 ## Validation
 
@@ -76,17 +79,22 @@ Run the project regression suite before trusting a change:
 python tests/test_core.py
 ```
 
-This checks the important protocol and model contract invariants, including:
+This checks CPU-level protocol and model contract invariants, including:
 
 - split disjointness
+- dataset membership at patient split boundaries
 - prompt bank separation
+- tokenizer-free baseline and contrastive-only paths
+- safe experiment manifest contents and supported preset validation
 - contrastive pooling and loss behavior
 - decoder gate-zero equivalence
 - metric sanity checks
 
+The suite does not establish training reproducibility, CUDA compatibility, or benchmark performance. Those require a complete CAMUS dataset and the configured training environment; no performance claim should be made without recorded runs and final test-set evaluation.
+
 ## Training
 
-The recommended workflow is to define a preset in `config.py` and then run the relevant training script:
+Set the data, pretrained-weight, and output paths through environment variables before launching a run. For the baseline:
 
 ```bash
 python train_camus.py
@@ -98,7 +106,13 @@ or
 python train_camus_contrastive.py
 ```
 
-For a reproducible paper-style ablation sweep, use the built-in runner:
+Inspect the four implemented ablations without starting training:
+
+```bash
+python run_ablation_suite.py --dry-run
+```
+
+To execute the sweep:
 
 ```bash
 python run_ablation_suite.py --run
@@ -110,7 +124,7 @@ and to collect a summary of logged results:
 python report_experiments.py
 ```
 
-The repository includes experiment preset definitions for baseline and contrastive variants in `config.PRESETS`.
+The runner records the seed, runtime configuration, selected non-secret environment settings, and split policy in JSON manifests under `CC_OUTPUT_ROOT/paper`. Its test cohort remains held out; a separate final test evaluation is required before reporting benchmark results.
 
 ## Citation and reuse
 

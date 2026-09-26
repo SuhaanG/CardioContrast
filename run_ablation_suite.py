@@ -15,9 +15,26 @@ DEFAULT_EXPERIMENT_ORDER = [
     "exp3_contrastive",
     "exp4_cardiocontrast",
 ]
+MANIFEST_ENV_KEYS = {
+    "CAMUS_DATA_DIR", "ECHONET_DATA_DIR", "PRETRAINED_SWIN", "BERT_PATH",
+    "CC_OUTPUT_ROOT", "CC_CHECKPOINT_DIR", "CC_SEED", "CC_EPOCHS",
+    "CC_IMG_SIZE", "CC_BATCH_SIZE", "CC_GRAD_ACCUM_STEPS", "CC_LR",
+    "CC_WEIGHT_DECAY", "CC_SWIN_TYPE", "CC_WINDOW_SIZE",
+    "CC_DECODE_WITH_LANG", "CC_CONTRASTIVE_WEIGHT", "CC_CONTRASTIVE_TAU",
+    "CC_BERT_TRAINABLE_LAYERS", "CC_EMBED_TOKENS", "CC_IMAGES_PER_BATCH",
+}
+
+
+def manifest_environment(env):
+    return {key: env[key] for key in sorted(MANIFEST_ENV_KEYS) if key in env}
 
 
 def build_env_for_preset(preset_name: str) -> Dict[str, str]:
+    if preset_name not in DEFAULT_EXPERIMENT_ORDER:
+        raise ValueError(
+            f"Unsupported ablation preset {preset_name!r}; supported presets are "
+            f"{DEFAULT_EXPERIMENT_ORDER}."
+        )
     env = os.environ.copy()
     if preset_name == "exp1_baseline":
         env["CC_DECODE_WITH_LANG"] = "0"
@@ -61,8 +78,12 @@ def run_experiments(experiment_order=None, dry_run=False):
                 "val": "for model selection only",
                 "test": "held back for final reporting",
             },
-            "env": env,
+            "seed": config.SEED,
+            "runtime": config.describe_runtime(),
+            "env": manifest_environment(env),
         }
+        summary["runtime"]["decode_with_lang"] = summary["decode_with_lang"]
+        summary["runtime"]["contrastive_weight"] = summary["contrastive_weight"]
         if dry_run:
             print(f"[dry-run] {name}: {' '.join(command)}")
             print(f"  decode_with_lang={summary['decode_with_lang']} contrastive_weight={summary['contrastive_weight']}")

@@ -5,6 +5,7 @@
 
 torch
 torchvision
+transformers>=4.40,<5
 nibabel
 numpy
 Pillow

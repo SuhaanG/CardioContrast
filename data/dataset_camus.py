@@ -3,7 +3,6 @@ import os
 import re
 
 import numpy as np
-import nibabel as nib
 import torch
 from PIL import Image
 from torch.utils import data
@@ -41,7 +40,7 @@ def index_images(data_dir, split):
 
 
 class CAMUSDataset(data.Dataset):
-    def __init__(self, data_dir, split="train", img_size=352, prompt_mode="fixed", eval_prompt_set="canonical", seed=42, epoch=0):
+    def __init__(self, data_dir, split="train", img_size=352, prompt_mode="fixed", eval_prompt_set="canonical", seed=42, epoch=0, use_language=True):
         self.data_dir = data_dir
         self.split = split
         self.img_size = img_size
@@ -49,6 +48,7 @@ class CAMUSDataset(data.Dataset):
         self.eval_prompt_set = eval_prompt_set
         self.seed = seed
         self.epoch = epoch
+        self.use_language = use_language
         self.records = index_images(data_dir, split)
         self.samples = []
         for i, record in enumerate(self.records):
@@ -59,6 +59,8 @@ class CAMUSDataset(data.Dataset):
         self._init_tokenizer()
 
     def _init_tokenizer(self):
+        if not self.use_language:
+            return
         try:
             from transformers import BertTokenizer
 
@@ -78,6 +80,8 @@ class CAMUSDataset(data.Dataset):
         self.epoch = epoch
 
     def _load_nifti_2d(self, path):
+        import nibabel as nib
+
         arr = np.asarray(nib.load(path).get_fdata())
         return np.squeeze(arr).astype(np.float32)
 
