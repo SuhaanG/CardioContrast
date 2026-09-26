@@ -3,6 +3,8 @@ import os
 
 def get_split_patients(data_dir, split):
     split = split.lower()
+    if split not in {"train", "val", "test"}:
+        raise ValueError(f"Unknown split {split!r}; expected train, val, or test")
     data_dir = os.path.abspath(data_dir)
     subgroup_dir = os.path.join(os.path.dirname(data_dir), "database_split")
     if split in {"train", "val", "test"}:

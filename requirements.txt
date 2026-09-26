@@ -19,3 +19,11 @@ filelock
 packaging
 tokenizers
 scipy
+pandas
+scikit-image
+opencv-python-headless
+
+# Optional external baselines:
+# nnunetv2
+# segment-anything
+# pyflakes

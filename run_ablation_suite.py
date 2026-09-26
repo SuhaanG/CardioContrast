@@ -14,6 +14,9 @@ DEFAULT_EXPERIMENT_ORDER = [
     "exp2_decoder_ca",
     "exp3_contrastive",
     "exp4_cardiocontrast",
+    "exp5_class_embedding",
+    "exp6_paraphrase",
+    "exp7_union_pool",
 ]
 MANIFEST_ENV_KEYS = {
     "CAMUS_DATA_DIR", "ECHONET_DATA_DIR", "PRETRAINED_SWIN", "BERT_PATH",
@@ -22,7 +25,7 @@ MANIFEST_ENV_KEYS = {
     "CC_WEIGHT_DECAY", "CC_SWIN_TYPE", "CC_WINDOW_SIZE",
     "CC_DECODE_WITH_LANG", "CC_CONTRASTIVE_WEIGHT", "CC_CONTRASTIVE_TAU",
     "CC_BERT_TRAINABLE_LAYERS", "CC_EMBED_TOKENS", "CC_IMAGES_PER_BATCH",
-    "CC_SPACING_UNIT",
+    "CC_SPACING_UNIT", "CC_CONTRASTIVE_POOL_REGION",
 }
 
 
@@ -37,23 +40,18 @@ def build_env_for_preset(preset_name: str) -> Dict[str, str]:
             f"{DEFAULT_EXPERIMENT_ORDER}."
         )
     env = os.environ.copy()
-    if preset_name == "exp1_baseline":
-        env["CC_DECODE_WITH_LANG"] = "0"
-        env["CC_CONTRASTIVE_WEIGHT"] = "0.0"
-        env["CC_EPOCHS"] = str(config.EPOCHS)
-        return env
-
     preset = config.PRESETS[preset_name]
     env["CC_DECODE_WITH_LANG"] = "1" if bool(preset.get("decode_with_lang", False)) else "0"
     env["CC_CONTRASTIVE_WEIGHT"] = str(float(preset.get("contrastive_weight", 0.0)))
     env["CC_EPOCHS"] = str(config.EPOCHS)
+    env["CC_CONTRASTIVE_POOL_REGION"] = str(preset.get("contrastive_pool_region", "pred"))
     return env
 
 
 def build_command_for_preset(preset_name: str) -> List[str]:
-    if preset_name == "exp1_baseline":
-        return [sys.executable, "train_camus.py"]
-    return [sys.executable, "train_camus_contrastive.py"]
+    if preset_name not in DEFAULT_EXPERIMENT_ORDER:
+        raise ValueError(f"Unsupported preset: {preset_name}")
+    return [sys.executable, "train_cardiocontrast.py", "--preset", preset_name]
 
 
 def run_experiments(experiment_order=None, dry_run=False):
@@ -63,12 +61,13 @@ def run_experiments(experiment_order=None, dry_run=False):
     manifest_root = Path(config.CC_OUTPUT_ROOT) / "paper"
     manifest_root.mkdir(parents=True, exist_ok=True)
     for name in experiment_order:
-        if name not in config.PRESETS and name != "exp1_baseline":
+        if name not in DEFAULT_EXPERIMENT_ORDER:
             raise KeyError(f"Unknown preset: {name}")
         command = build_command_for_preset(name)
         env = build_env_for_preset(name)
         summary = {
             "experiment": name,
+            "preset": config.PRESETS[name],
             "command": " ".join(command),
             "decode_with_lang": bool(int(env.get("CC_DECODE_WITH_LANG", "0"))),
             "contrastive_weight": float(env.get("CC_CONTRASTIVE_WEIGHT", "0.0")),
@@ -106,8 +105,9 @@ def run_experiments(experiment_order=None, dry_run=False):
                 break
             summary["status"] = "ok"
             summary["returncode"] = 0
-            summary["checkpoint_dir"] = str(Path(config.CC_OUTPUT_ROOT) / "checkpoints")
-            summary["best_checkpoint"] = str(Path(config.CC_OUTPUT_ROOT) / "checkpoints" / ("model_best_exp4_cardiocontrast.pth" if name == "exp4_cardiocontrast" else "model_best_exp2_decoder_ca.pth" if name == "exp2_decoder_ca" else "model_best_exp3_contrastive_only.pth" if name == "exp3_contrastive" else "model_best_camus.pth"))
+            run_dir = Path(config.CC_OUTPUT_ROOT) / f"{name}_seed{config.SEED}"
+            summary["run_dir"] = str(run_dir)
+            summary["best_checkpoint"] = str(run_dir / "best.pth")
             results.append(summary)
             manifest_path = manifest_root / f"{name}_manifest.json"
             manifest_path.write_text(json.dumps(summary, indent=2, sort_keys=True))

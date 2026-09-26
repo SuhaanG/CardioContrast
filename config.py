@@ -9,14 +9,14 @@ PRETRAINED_SWIN = os.environ.get("PRETRAINED_SWIN", "")
 BERT_PATH = os.environ.get("BERT_PATH", "bert-base-uncased")
 CC_OUTPUT_ROOT = os.environ.get("CC_OUTPUT_ROOT", os.path.join("outputs", "cardiocontrast"))
 
-DEVICE = "cuda" if os.environ.get("CUDA_VISIBLE_DEVICES") else "cpu"
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 DEFAULTS = {
     "seed": 42,
     "epochs": 40,
     "img_size": 352,
     "batch_size": 3,
-    "grad_accum_steps": 4,
+    "grad_accum_steps": 2,
     "learning_rate": 5e-5,
     "weight_decay": 1e-2,
     "swin_type": "base",
@@ -24,6 +24,7 @@ DEFAULTS = {
     "decode_with_lang": True,
     "contrastive_weight": 0.1,
     "contrastive_tau": 0.07,
+    "contrastive_pool_region": "pred",
     "bert_trainable_layers": 10,
     "embed_tokens": 8,
     "images_per_batch": 2,
@@ -34,9 +35,9 @@ PRESETS = {
     "exp2_decoder_ca": {"decode_with_lang": True, "contrastive_weight": 0.0, "exp_name": "exp2_decoder_ca"},
     "exp3_contrastive": {"decode_with_lang": False, "contrastive_weight": 0.1, "exp_name": "exp3_contrastive"},
     "exp4_cardiocontrast": {"decode_with_lang": True, "contrastive_weight": 0.1, "exp_name": "exp4_cardiocontrast"},
-    "exp5_class_embedding": {"decode_with_lang": False, "contrastive_weight": 0.1, "text_encoder": "embedding", "exp_name": "exp5_class_embedding"},
+    "exp5_class_embedding": {"decode_with_lang": True, "contrastive_weight": 0.1, "text_encoder": "embedding", "exp_name": "exp5_class_embedding"},
     "exp6_paraphrase": {"decode_with_lang": True, "contrastive_weight": 0.1, "prompt_mode": "paraphrase", "exp_name": "exp6_paraphrase"},
-    "exp7_union_pool": {"decode_with_lang": True, "contrastive_weight": 0.1, "pool_region": "union", "exp_name": "exp7_union_pool"},
+    "exp7_union_pool": {"decode_with_lang": True, "contrastive_weight": 0.1, "contrastive_pool_region": "union", "exp_name": "exp7_union_pool"},
 }
 
 SEED = int(os.environ.get("CC_SEED", DEFAULTS["seed"]))
@@ -48,12 +49,15 @@ LR = float(os.environ.get("CC_LR", DEFAULTS["learning_rate"]))
 WEIGHT_DECAY = float(os.environ.get("CC_WEIGHT_DECAY", DEFAULTS["weight_decay"]))
 SWIN_TYPE = os.environ.get("CC_SWIN_TYPE", DEFAULTS["swin_type"])
 WINDOW_SIZE = int(os.environ.get("CC_WINDOW_SIZE", DEFAULTS["window_size"]))
-if WINDOW_SIZE not in {7, 12}:
-    raise ValueError("CC_WINDOW_SIZE must be either 7 or 12")
+if WINDOW_SIZE < 1:
+    raise ValueError("CC_WINDOW_SIZE must be positive")
 SPACING_UNIT = os.environ.get("CC_SPACING_UNIT", "").strip().lower()
 DECODE_WITH_LANG = bool(int(os.environ.get("CC_DECODE_WITH_LANG", int(DEFAULTS["decode_with_lang"]))))
 CONTRASTIVE_WEIGHT = float(os.environ.get("CC_CONTRASTIVE_WEIGHT", DEFAULTS["contrastive_weight"]))
 CONTRASTIVE_TAU = float(os.environ.get("CC_CONTRASTIVE_TAU", DEFAULTS["contrastive_tau"]))
+CONTRASTIVE_POOL_REGION = os.environ.get("CC_CONTRASTIVE_POOL_REGION", DEFAULTS["contrastive_pool_region"])
+if CONTRASTIVE_POOL_REGION not in {"pred", "gt", "union"}:
+    raise ValueError("CC_CONTRASTIVE_POOL_REGION must be pred, gt, or union")
 BERT_TRAINABLE_LAYERS = int(os.environ.get("CC_BERT_TRAINABLE_LAYERS", DEFAULTS["bert_trainable_layers"]))
 EMBED_TOKENS = int(os.environ.get("CC_EMBED_TOKENS", DEFAULTS["embed_tokens"]))
 IMAGES_PER_BATCH = int(os.environ.get("CC_IMAGES_PER_BATCH", DEFAULTS["images_per_batch"]))
@@ -101,6 +105,7 @@ def describe_runtime():
         "decode_with_lang": DECODE_WITH_LANG,
         "contrastive_weight": CONTRASTIVE_WEIGHT,
         "contrastive_tau": CONTRASTIVE_TAU,
+        "contrastive_pool_region": CONTRASTIVE_POOL_REGION,
         "python_rng_seeded": True,
         "numpy_rng_seeded": True,
         "torch_rng_seeded": True,

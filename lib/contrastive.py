@@ -41,6 +41,8 @@ def masked_average_pool(features, mask_logits):
 
 
 def contrastive_repulsion_loss(embeddings, image_ids, structure_ids, tau=0.07):
+    if tau <= 0:
+        raise ValueError("tau must be positive")
     embeddings = F.normalize(embeddings, dim=1)
     device = embeddings.device
     sim = embeddings @ embeddings.T
@@ -48,7 +50,7 @@ def contrastive_repulsion_loss(embeddings, image_ids, structure_ids, tau=0.07):
     image_ids = image_ids.to(device)
     structure_ids = structure_ids.to(device)
     if embeddings.size(0) < 2:
-        zero = torch.zeros((), device=device, requires_grad=True)
+        zero = embeddings.sum() * 0.0
         return zero, zero, 0
 
     neg_losses = []
@@ -66,8 +68,8 @@ def contrastive_repulsion_loss(embeddings, image_ids, structure_ids, tau=0.07):
         neg_cosines.append(F.cosine_similarity(embeddings[i].unsqueeze(0), embeddings[neg_idx]).mean())
 
     if not neg_losses:
-        zero = torch.zeros((), device=device)
-        return zero.requires_grad_(True), zero.detach(), 0
+        zero = embeddings.sum() * 0.0
+        return zero, zero.detach(), 0
 
     loss = torch.stack(neg_losses).mean()
     neg_cos = torch.stack(neg_cosines).mean() if neg_cosines else torch.zeros((), device=device)
@@ -80,14 +82,22 @@ class ContrastiveAnatomicalLoss(nn.Module):
         self.projection_head = ProjectionHead(in_dim, proj_hidden_dim, proj_out_dim)
         self.tau = tau
 
-    def forward(self, features, mask_logits, image_ids, structure_ids, pool_region="pred"):
+    def forward(self, features, mask_logits, image_ids, structure_ids,
+                pool_region="pred", gt_masks=None, union_masks=None,
+                detach_pooling=True):
         if pool_region == "pred":
             weights = torch.softmax(mask_logits, dim=1)[:, 1:2]
+        elif pool_region == "gt":
+            if gt_masks is None:
+                raise ValueError("gt_masks are required for pool_region='gt'")
+            weights = gt_masks
         elif pool_region == "union":
-            weights = (mask_logits > 0).float().mean(dim=1, keepdim=True)
+            if union_masks is None:
+                raise ValueError("union_masks are required for pool_region='union'")
+            weights = union_masks
         else:
-            weights = None
-        pooled = weighted_pool(features, weights, detach=True)
+            raise ValueError(f"Unknown pool_region={pool_region!r}")
+        pooled = weighted_pool(features, weights, detach=detach_pooling)
         projected = self.projection_head(pooled)
         loss, neg_cos, n_anchors = contrastive_repulsion_loss(projected, image_ids, structure_ids, self.tau)
         return loss, neg_cos, n_anchors

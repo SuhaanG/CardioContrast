@@ -26,10 +26,11 @@ TRAIN_BANK = {
     3: [
         "the left atrium",
         "LA chamber",
+        "left atrial chamber",
         "left atrial cavity",
         "the left atrial blood pool",
-        "the left atrium appendage region",
-        "atrium of the left ventricle side",
+        "the LA blood-pool cavity",
+        "the left atrial lumen",
         "the left atrial cavity boundary",
     ],
 }

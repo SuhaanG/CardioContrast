@@ -1,72 +1,45 @@
-"""
-data/samplers.py — Custom batch sampler for contrastive training.
+"""Deterministic minibatches containing complete per-image structure triplets."""
 
-Guarantees every batch contains all 3 structure prompts from the same image,
-so the contrastive loss always has same-image-different-structure negative pairs.
-
-Fix: the original sampler passed full-dataset indices to a DataLoader that wraps
-a Subset. The Subset re-indexes from 0, so full-dataset indices were fetching
-wrong samples. This version works directly with the Subset by using
-positional indices into train_ds, not into the full dataset.
-"""
+from collections import defaultdict
+from typing import Iterator, List
 
 import numpy as np
 from torch.utils.data import Sampler
-from collections import defaultdict
 
 
-class GroupedStructureSampler(Sampler):
-    """
-    Each batch is guaranteed to contain all 3 structures from the same image.
-    Works on the Subset directly using positional indices into train_ds.
+class GroupedStructureBatchSampler(Sampler[List[int]]):
+    def __init__(self, dataset, images_per_batch=2, shuffle=True, seed=42):
+        if images_per_batch < 1:
+            raise ValueError("images_per_batch must be positive")
+        self.dataset = dataset
+        self.images_per_batch = int(images_per_batch)
+        self.shuffle = bool(shuffle)
+        self.seed = int(seed)
+        self.epoch = 0
+        if hasattr(dataset, "image_groups"):
+            self.groups = dataset.image_groups()
+        else:
+            grouped = defaultdict(list)
+            for index, sample in enumerate(dataset.samples):
+                grouped[int(sample["image_idx"])].append(index)
+            self.groups = dict(grouped)
+        if any(len(indices) != 3 for indices in self.groups.values()):
+            raise ValueError("Every image must have exactly three structure prompts")
+        self.image_ids = sorted(self.groups)
 
-    Args:
-        train_ds:   torch.utils.data.Subset (the training split)
-        batch_size: must be >= 3 to fit all 3 structures from one image
-        shuffle:    shuffle image order each epoch
-    """
-    def __init__(self, train_ds, batch_size, shuffle=True):
-        if batch_size < 3:
-            raise ValueError("batch_size must be >= 3 to include every structure")
-        self.batch_size = batch_size
-        self.shuffle    = shuffle
+    def set_epoch(self, epoch):
+        self.epoch = int(epoch)
 
-        # Group positional indices (0..len(train_ds)-1) by image_idx.
-        dataset = getattr(train_ds, "dataset", train_ds)
-        source_indices = getattr(train_ds, "indices", range(len(train_ds)))
-        self.groups = defaultdict(list)
-        for pos, full_idx in enumerate(source_indices):
-            sample = dataset.samples[full_idx]
-            self.groups[sample["image_idx"]].append(pos)
-
-        self.image_keys  = list(self.groups.keys())
-        self.all_pos_idx = list(range(len(train_ds)))
-
-    def __iter__(self):
-        image_keys  = self.image_keys.copy()
-        all_pos_idx = self.all_pos_idx.copy()
+    def __iter__(self) -> Iterator[List[int]]:
+        image_ids = np.asarray(self.image_ids, dtype=np.int64)
         if self.shuffle:
-            np.random.shuffle(image_keys)
-            np.random.shuffle(all_pos_idx)
-
-        fill_pool = iter(all_pos_idx)
-
-        for key in image_keys:
-            group = self.groups[key]           # positional indices for this image
-            batch = list(group[:3])            # take all 3 structures (labels 1,2,3)
-            while len(batch) < self.batch_size:
-                try:
-                    candidate = next(fill_pool)
-                except StopIteration:
-                    all_pos_idx = self.all_pos_idx.copy()
-                    np.random.shuffle(all_pos_idx)
-                    fill_pool = iter(all_pos_idx)
-                    candidate = next(fill_pool)
-                if candidate not in group:
-                    batch.append(candidate)
-            if self.shuffle:
-                np.random.shuffle(batch)
-            yield from batch[:self.batch_size]
+            rng = np.random.default_rng([self.seed, self.epoch])
+            image_ids = rng.permutation(image_ids)
+        usable = len(image_ids) // self.images_per_batch * self.images_per_batch
+        for offset in range(0, usable, self.images_per_batch):
+            batch_images = image_ids[offset:offset + self.images_per_batch]
+            batch = [index for image_id in batch_images for index in self.groups[int(image_id)]]
+            yield batch
 
     def __len__(self):
-        return len(self.image_keys) * self.batch_size
+        return len(self.image_ids) // self.images_per_batch

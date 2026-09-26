@@ -1,8 +1,8 @@
 import math
-import os
 import sys
 import tempfile
-from types import SimpleNamespace
+from argparse import Namespace
+import csv
 from pathlib import Path
 
 import numpy as np
@@ -12,118 +12,279 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from data.dataset_camus import (
+    CAMUSDataset,
+    index_images,
+    preprocess_grayscale_image,
+    spacing_to_mm,
+)
 from data.prompts import CANONICAL, HELDOUT, STRUCTURES, TRAIN_BANK
+from data.samplers import GroupedStructureBatchSampler
 from data.splits import assert_disjoint, get_split_patients
-from data.dataset_camus import CAMUSDataset, index_images, preprocess_grayscale_image, spacing_to_mm
-from data.dataset_camus_contrastive import CAMUSDatasetContrastive
-from data.samplers import GroupedStructureSampler
+from compare_runs import compare_runs
+from evaluate_echonet import build_tracing_masks, orient
+from lib._utils import CardioContrastNet
 from lib.contrastive import ContrastiveAnatomicalLoss, weighted_pool
 from lib.mask_predictor import DecoderCrossAttention, SimpleDecoding
-from lib._utils import LAVTOne
+from lib.metrics import binary_metrics, leakage, per_structure_metrics, simpson_volume, ejection_fraction
 from lib.paper_results import aggregate_patient_metrics
+from lib.report import Reporter
 from run_ablation_suite import build_env_for_preset, manifest_environment
+from train_cardiocontrast import build_optimizer, resolve_args, segmentation_loss
+from tools.make_table import make_tables
+import config
 
 
-def test_split_and_prompts():
+def test_split_and_prompt_protocol():
     with tempfile.TemporaryDirectory() as tmp:
-        base = os.path.join(tmp, "database_nifti")
-        os.makedirs(base)
-        for idx in range(1, 501):
-            os.makedirs(os.path.join(base, f"patient{idx:03d}"), exist_ok=True)
-        train, val, test = get_split_patients(base, "train"), get_split_patients(base, "val"), get_split_patients(base, "test")
-        assert len(train) == 400 and len(val) == 50 and len(test) == 50
+        data_dir = Path(tmp) / "database_nifti"
+        data_dir.mkdir()
+        for patient_id in range(1, 501):
+            (data_dir / f"patient{patient_id:03d}").mkdir()
+        train = get_split_patients(str(data_dir), "train")
+        val = get_split_patients(str(data_dir), "val")
+        test = get_split_patients(str(data_dir), "test")
+        assert (len(train), len(val), len(test)) == (400, 50, 50)
         assert_disjoint(train, val, test)
-        assert set(CANONICAL.keys()) == set(STRUCTURES.keys())
-        train_prompts = {prompt for prompts in TRAIN_BANK.values() for prompt in prompts}
-        heldout_prompts = {prompt for prompts in HELDOUT.values() for prompt in prompts}
-        overlap = train_prompts & heldout_prompts
-        assert not overlap, f"prompt overlap found: {overlap}"
+        try:
+            get_split_patients(str(data_dir), "testing_typo")
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("invalid split names must not fall back to test")
+
+    assert set(CANONICAL) == set(STRUCTURES)
+    train_prompts = {prompt for bank in TRAIN_BANK.values() for prompt in bank}
+    heldout_prompts = {prompt for bank in HELDOUT.values() for prompt in bank}
+    assert not train_prompts & heldout_prompts
+    assert all(len(bank) >= 6 for bank in TRAIN_BANK.values())
+    assert all(len(bank) == 3 for bank in HELDOUT.values())
 
 
-def test_dataset_uses_patient_split_boundaries():
+def test_dataset_split_metadata_and_heldout_prompts():
     with tempfile.TemporaryDirectory() as tmp:
         data_dir = Path(tmp) / "database_nifti"
         for patient_id in (1, 400, 401, 450, 451, 500):
             patient = f"patient{patient_id:03d}"
             patient_dir = data_dir / patient
             patient_dir.mkdir(parents=True)
-            image_name = f"{patient}_2CH_ED.nii.gz"
-            (patient_dir / image_name).touch()
-            (patient_dir / image_name.replace(".nii.gz", "_gt.nii.gz")).touch()
+            (patient_dir / "Info_2CH.cfg").write_text(
+                "ImageQuality: Good\nLVef: 57.5\n", encoding="utf-8"
+            )
+            image = f"{patient}_2CH_ED.nii.gz"
+            (patient_dir / image).touch()
+            (patient_dir / image.replace(".nii.gz", "_gt.nii.gz")).touch()
 
         train = index_images(str(data_dir), "train")
         val = index_images(str(data_dir), "val")
         test = index_images(str(data_dir), "test")
-        assert {row["patient"] for row in train} == {"patient001", "patient400"}
-        assert {row["patient"] for row in val} == {"patient401", "patient450"}
-        assert {row["patient"] for row in test} == {"patient451", "patient500"}
+        assert {record["patient"] for record in train} == {"patient001", "patient400"}
+        assert {record["patient"] for record in val} == {"patient401", "patient450"}
+        assert {record["patient"] for record in test} == {"patient451", "patient500"}
+        assert test[0]["quality"] == "Good"
+        assert test[0]["ref_ef"] == 57.5
+        assert test[0]["case_id"] == "patient451_2CH"
 
-        contrastive_train = CAMUSDatasetContrastive(
-            str(data_dir), split="train", use_language=False
+        heldout = CAMUSDataset(
+            str(data_dir), split="test", eval_prompt_set="heldout", use_language=False
         )
-        contrastive_val = CAMUSDatasetContrastive(
-            str(data_dir), split="val", use_language=False
+        assert len(heldout.samples) == 2 * 3 * 3
+        samples = [s for s in heldout.samples if s["image_idx"] == 0 and s["structure"] == 1]
+        resolved = [heldout._resolve_prompt(1, 0, s["prompt_k"]) for s in samples]
+        assert resolved == HELDOUT[1]
+
+
+def test_dataset_augmentation_shared_and_seeded_by_epoch():
+    with tempfile.TemporaryDirectory() as tmp:
+        dataset = CAMUSDataset(tmp, split="train", use_language=False, seed=27)
+        image = np.tile(np.linspace(0, 1, 32, dtype=np.float32), (24, 1))
+        mask = np.zeros((24, 32), dtype=np.uint8)
+        mask[5:18, 8:23] = 2
+        first_image, first_mask = dataset._augment_image_and_mask(image, mask, 4)
+        repeated_image, repeated_mask = dataset._augment_image_and_mask(image, mask, 4)
+        assert np.array_equal(first_image, repeated_image)
+        assert np.array_equal(first_mask, repeated_mask)
+        assert set(np.unique(first_mask)).issubset({0, 2})
+        dataset.set_epoch(1)
+        next_image, next_mask = dataset._augment_image_and_mask(image, mask, 4)
+        assert not np.array_equal(first_image, next_image)
+        assert not np.array_equal(first_mask, next_mask)
+
+
+def test_grouped_batch_sampler_contract():
+    class SampleSet:
+        samples = [
+            {"image_idx": image_id, "structure": structure_id}
+            for image_id in range(5)
+            for structure_id in (1, 2, 3)
+        ]
+
+        def __len__(self):
+            return len(self.samples)
+
+    dataset = SampleSet()
+    sampler = GroupedStructureBatchSampler(dataset, images_per_batch=2, seed=15)
+    epoch_zero = list(sampler)
+    assert epoch_zero == list(sampler)
+    assert len(sampler) == 2
+    for batch in epoch_zero:
+        assert len(batch) == 6
+        samples = [dataset.samples[index] for index in batch]
+        for image_id in {sample["image_idx"] for sample in samples}:
+            assert {s["structure"] for s in samples if s["image_idx"] == image_id} == {1, 2, 3}
+    sampler.set_epoch(1)
+    assert list(sampler) != epoch_zero
+
+
+def test_contrastive_pooling_and_loss():
+    features = torch.randn(3, 4, 5, 5)
+    pooled = weighted_pool(features, torch.ones(3, 1, 5, 5))
+    assert pooled.shape == (3, 4)
+
+    loss_fn = ContrastiveAnatomicalLoss(4, proj_hidden_dim=8, proj_out_dim=4, tau=0.07)
+    features = torch.randn(3, 4, 3, 3, requires_grad=True)
+    logits = torch.randn(3, 2, 3, 3, requires_grad=True)
+    image_ids = torch.tensor([0, 0, 1])
+    structures = torch.tensor([1, 2, 1])
+    loss, neg_cos, anchors = loss_fn(features, logits, image_ids, structures, pool_region="pred")
+    assert torch.isfinite(loss) and neg_cos.shape == () and anchors == 2
+    loss.backward()
+    assert logits.grad is None
+
+    masks = torch.zeros(3, 3, 3)
+    masks[:, 1, 1] = 1
+    for region in ("gt", "union"):
+        region_loss, _, count = loss_fn(
+            features.detach(), logits.detach(), image_ids, structures,
+            pool_region=region, gt_masks=masks, union_masks=torch.ones_like(masks),
         )
-        contrastive_test = CAMUSDatasetContrastive(
-            str(data_dir), split="test", use_language=False
-        )
-        patient_names = lambda dataset: {
-            Path(sample["image_path"]).parent.name for sample in dataset.samples
-        }
-        assert patient_names(contrastive_train) == {"patient001", "patient400"}
-        assert patient_names(contrastive_val) == {"patient401", "patient450"}
-        assert patient_names(contrastive_test) == {"patient451", "patient500"}
+        assert torch.isfinite(region_loss) and count == 2
+
+    no_negative_features = torch.randn(1, 4, 3, 3, requires_grad=True)
+    no_negative, _, count = loss_fn(
+        no_negative_features, logits[:1].detach(), image_ids[:1], structures[:1]
+    )
+    assert no_negative.item() == 0.0 and count == 0
+    no_negative.backward()
+    assert no_negative_features.grad is not None
 
 
-def test_ablation_manifest_is_filtered_and_presets_are_explicit():
-    safe = manifest_environment({
-        "CC_SEED": "42",
-        "CC_DECODE_WITH_LANG": "1",
-        "AWS_SECRET_ACCESS_KEY": "do-not-record",
-    })
-    assert safe == {"CC_DECODE_WITH_LANG": "1", "CC_SEED": "42"}
-    try:
-        build_env_for_preset("exp5_class_embedding")
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("unsupported preset must not silently run as another experiment")
+def test_decoder_zero_gates_and_padding_mask():
+    batch, height, width = 2, 8, 8
+    pyramid = (
+        torch.randn(batch, 8, height, width),
+        torch.randn(batch, 4, height // 2, width // 2),
+        torch.randn(batch, 2, height // 4, width // 4),
+        torch.randn(batch, 1, height // 8, width // 8),
+    )
+    lang = torch.randn(batch, 768, 8)
+    mask = torch.ones(batch, 8, 1, dtype=torch.long)
+    conditioned = SimpleDecoding(c4_dims=8, lang_dim=768, num_heads=4)
+    baseline = SimpleDecoding(c4_dims=8, lang_dim=768, num_heads=4)
+    baseline.load_state_dict(conditioned.state_dict())
+    for stage in (conditioned.ca_stage1, conditioned.ca_stage2, conditioned.ca_stage3):
+        stage.gate.data.zero_()
+    assert torch.allclose(
+        conditioned(*pyramid, lang_feat=lang, lang_mask=mask), baseline(*pyramid),
+        atol=1e-5, rtol=1e-5,
+    )
+
+    layer = DecoderCrossAttention(8, lang_dim=768, num_heads=2).eval()
+    visual = torch.randn(2, 8, 5, 5)
+    tokens = torch.randn(2, 768, 6)
+    token_mask = torch.tensor([[1, 1, 1, 0, 0, 0], [1, 1, 0, 0, 0, 0]])
+    changed_padding = tokens.clone()
+    changed_padding[:, :, 2:] = torch.randn_like(changed_padding[:, :, 2:]) * 1e5
+    out1 = layer(visual, tokens, token_mask.unsqueeze(-1))
+    out2 = layer(visual, changed_padding, token_mask.unsqueeze(-1))
+    assert torch.allclose(out1, out2, atol=1e-5, rtol=1e-5)
 
 
-def test_baseline_model_skips_text_encoder():
-    class IdentityBackbone(torch.nn.Module):
-        def forward(self, image):
+def test_cardio_model_class_embedding_forward():
+    class Backbone(torch.nn.Module):
+        def forward(self, image, lang_feat, lang_mask):
+            assert lang_feat.shape == (2, 768, 8)
+            assert lang_mask.shape == (2, 8, 1)
             return image, image, image, image
 
-    class TwoClassHead(torch.nn.Module):
-        def forward(self, x_c4, x_c3, x_c2, x_c1, **kwargs):
-            return torch.cat((x_c4, x_c4), dim=1), x_c4
+    class Head(torch.nn.Module):
+        def forward(self, x_c4, x_c3, x_c2, x_c1, lang_feat=None,
+                    lang_mask=None, return_features=False):
+            assert lang_feat is None and lang_mask is None
+            output = torch.cat((x_c4, x_c4), dim=1)
+            return (output, x_c4) if return_features else output
 
-    model = LAVTOne(
-        IdentityBackbone(),
-        TwoClassHead(),
-        SimpleNamespace(decode_with_lang=False),
+    model = CardioContrastNet(
+        Backbone(), Head(), text_encoder="embedding", decode_with_lang=False,
+        embed_tokens=8,
     )
-    image = torch.randn(2, 1, 8, 8)
-    output = model(image, text=None, l_mask=None)
-    assert model.text_encoder is None
+    output = model(
+        torch.randn(2, 1, 8, 8), torch.zeros(2, 4, dtype=torch.long),
+        torch.ones(2, 4, dtype=torch.long), torch.tensor([0, 2]),
+    )
     assert output.shape == (2, 2, 8, 8)
 
 
-def test_non_language_datasets_skip_tokenizer_loading():
-    with tempfile.TemporaryDirectory() as tmp:
-        data_dir = str(Path(tmp) / "database_nifti")
-        baseline = CAMUSDataset(data_dir, split="train", use_language=False)
-        contrastive = CAMUSDatasetContrastive(
-            data_dir,
-            split="train",
-            use_language=False,
-        )
-        assert baseline.tokenizer is None
-        assert contrastive.tokenizer is None
+def test_metric_shapes_empty_leakage_and_spacing():
+    pred = np.zeros((40, 40), dtype=np.uint8)
+    gt = np.zeros_like(pred)
+    pred[10:20, 10:20] = 1
+    gt[10:20, 15:25] = 1
+    metrics = binary_metrics(pred, gt, spacing=(0.5, 0.5))
+    assert metrics["dice"] == 0.5
+    assert abs(metrics["hd"] - 2.5) < 1e-6
+
+    wide_left = np.zeros((40, 70), dtype=np.uint8)
+    wide_right = np.zeros_like(wide_left)
+    wide_left[10:30, 5:45] = 1
+    wide_right[10:30, 15:55] = 1
+    shifted = binary_metrics(wide_left, wide_right, spacing=(0.5, 0.5))
+    assert abs(shifted["dice"] - 0.75) < 1e-6
+    assert abs(shifted["hd"] - 5.0) < 1e-6
+
+    unequal_contour = np.zeros_like(gt)
+    unequal_contour[8:22, 15:25] = 1
+    unequal_metrics = binary_metrics(pred, unequal_contour, spacing=(0.5, 0.5))
+    assert np.isfinite(unequal_metrics["hd95"])
+
+    empty = binary_metrics(np.zeros_like(gt), np.zeros_like(gt), (0.5, 0.5))
+    assert empty["dice"] == 1 and empty["empty_case"]
+    one_empty = binary_metrics(pred, np.zeros_like(gt), (0.5, 0.5))
+    assert one_empty["dice"] == 0 and one_empty["empty_case"]
+    full = np.zeros_like(gt)
+    full[10:20, 10:20] = 1
+    full[20:23, 10:20] = 2
+    predicted = np.zeros_like(full)
+    predicted[10:20, 10:20] = 1
+    predicted[20:23, 10:20] = 1
+    assert abs(leakage(predicted, full, 1) - 0.23076923076923078) < 1e-6
+    structure_metrics = per_structure_metrics(pred, gt, structure_id=1, spacing=(0.5, 0.5))
+    assert structure_metrics["structure_id"] == 1
+
+    assert spacing_to_mm((0.002, 0.003), "meter") == (2.0, 3.0)
+    assert spacing_to_mm((0.5, 0.6), "unknown", assumed_unit="mm") == (0.5, 0.6)
 
 
-def test_patient_clustered_result_aggregation():
+def test_preprocessing_and_simpson_metrics():
+    image = preprocess_grayscale_image(np.full((3, 4), 255, dtype=np.uint8), 2)
+    expected = torch.tensor([(1 - 0.485) / 0.229, (1 - 0.456) / 0.224, (1 - 0.406) / 0.225])
+    assert image.shape == (3, 2, 2)
+    assert torch.allclose(image[:, 0, 0], expected, atol=1e-6)
+
+    rows, columns = np.ogrid[:101, :101]
+    ellipse = ((columns - 50) ** 2 / 40 ** 2 + (rows - 50) ** 2 / 20 ** 2) <= 1
+    la = np.zeros_like(ellipse)
+    la[45:56, 2:10] = 1
+    analytic_ml = 4.0 / 3.0 * math.pi * 40 * 20 * 20 / 1000.0
+    volume_contact = simpson_volume(ellipse, ellipse, la, la)
+    volume_fallback = simpson_volume(ellipse, ellipse)
+    assert abs(volume_contact - analytic_ml) / analytic_ml < 0.05
+    assert abs(volume_fallback - analytic_ml) / analytic_ml < 0.10
+    assert simpson_volume(np.zeros_like(ellipse), ellipse) == 0.0
+    assert abs(ejection_fraction(100.0, 40.0) - 60.0) < 1e-6
+
+
+def test_patient_aggregates_and_report_outputs():
     rows = [
         {"patient": "p1", "structure_id": 1, "dice": 0.2, "iou": 0.1},
         {"patient": "p1", "structure_id": 1, "dice": 0.4, "iou": 0.3},
@@ -131,181 +292,146 @@ def test_patient_clustered_result_aggregation():
         {"patient": "p3", "structure_id": 1, "dice": 0.9, "iou": 0.8},
     ]
     aggregated = aggregate_patient_metrics(rows, n_bootstrap=100, seed=7)
-    patient_rows = aggregated["patient_metrics"]
-    assert len(patient_rows) == 3
-    assert patient_rows[0]["n_frames"] == 2
-    assert abs(patient_rows[0]["dice"] - 0.3) < 1e-8
-    summary = aggregated["structure_summary"]["1"]
-    assert summary["n_patients"] == 3
-    assert summary["metrics"]["dice"]["n"] == 3
-    assert abs(summary["metrics"]["dice"]["estimate"] - (0.3 + 0.8 + 0.9) / 3) < 1e-8
+    assert len(aggregated["patient_metrics"]) == 3
+    assert abs(aggregated["patient_metrics"][0]["dice"] - 0.3) < 1e-8
+
+    reporter = Reporter()
+    height, width = 80, 100
+    y, x = np.ogrid[:height, :width]
+    for phase, radius_x, radius_y in (("ED", 30, 16), ("ES", 22, 12)):
+        lv = ((x - 50) ** 2 / radius_x ** 2 + (y - 40) ** 2 / radius_y ** 2) <= 1
+        la = np.zeros((height, width), dtype=bool)
+        la[35:46, 12:20] = True
+        gt_full = np.zeros((height, width), dtype=np.uint8)
+        gt_full[lv] = 1
+        gt_full[la] = 3
+        for view in ("2CH", "4CH"):
+            for structure, prediction in ((1, lv), (3, la)):
+                reporter.add("p1", view, phase, "Good", 58.0,
+                             structure, "prompt", prediction, gt_full, (1.0, 1.0))
+    with tempfile.TemporaryDirectory() as tmp:
+        summary = reporter.write(tmp, {"experiment": "synthetic"})
+        for filename in ("per_sample.csv", "per_patient.csv", "clinical.csv", "summary.json"):
+            assert (Path(tmp) / filename).is_file()
+        assert summary["clinical"]["gt_ef_vs_cfg"]["n"] == 1
 
 
-def test_nifti_spacing_conversion_requires_units():
-    assert spacing_to_mm((0.002, 0.003), "meter") == (2.0, 3.0)
-    assert spacing_to_mm((0.5, 0.6), "unknown", assumed_unit="mm") == (0.5, 0.6)
-    try:
-        spacing_to_mm((0.5, 0.6), "unknown")
-    except ValueError:
-        pass
-    else:
-        raise AssertionError("unknown spatial units must not be reported as millimeters")
-
-
-def test_shared_grayscale_preprocessing_uses_channelwise_normalization():
-    image = preprocess_grayscale_image(np.full((3, 4), 255, dtype=np.uint8), img_size=2)
-    expected = torch.tensor([
-        (1.0 - 0.485) / 0.229,
-        (1.0 - 0.456) / 0.224,
-        (1.0 - 0.406) / 0.225,
-    ])
-    assert image.shape == (3, 2, 2)
-    assert torch.allclose(image[:, 0, 0], expected, atol=1e-6)
-
-
-def test_grouped_sampler_keeps_structure_triplets_together():
-    class SampleSet:
-        def __init__(self):
-            self.samples = [
-                {"image_idx": image_id, "label": structure_id}
-                for image_id in range(2)
-                for structure_id in (1, 2, 3)
-            ]
-
-        def __len__(self):
-            return len(self.samples)
-
-    dataset = SampleSet()
-    sampler = GroupedStructureSampler(dataset, batch_size=3, shuffle=False)
-    sampled_indices = list(sampler)
-    for offset in range(0, len(sampled_indices), 3):
-        batch = [dataset.samples[index] for index in sampled_indices[offset:offset + 3]]
-        assert len({sample["image_idx"] for sample in batch}) == 1
-        assert {sample["label"] for sample in batch} == {1, 2, 3}
-
-    larger_sampler = GroupedStructureSampler(dataset, batch_size=4, shuffle=False)
-    larger_indices = list(larger_sampler)
-    for offset in range(0, len(larger_indices), 4):
-        batch = [dataset.samples[index] for index in larger_indices[offset:offset + 4]]
-        assert any(
-            {sample["label"] for sample in batch if sample["image_idx"] == image_id} == {1, 2, 3}
-            for image_id in range(2)
+def test_training_presets_and_optimizer_coverage():
+    parsed = Namespace(**{
+        key: None for key in (
+            "seed", "epochs", "img_size", "window_size", "swin_type", "pretrained_swin",
+            "data_dir", "output_root", "bert_path", "bert_trainable_layers", "embed_tokens",
+            "decode_with_lang", "contrastive_weight", "contrastive_tau", "pool_region",
+            "text_encoder", "prompt_mode", "images_per_batch", "grad_accum_steps",
+            "learning_rate", "weight_decay", "max_images", "device", "resume",
         )
+    })
+    parsed.workers = 0
+    for preset in config.PRESETS:
+        parsed.preset = preset
+        resolved = resolve_args(parsed)
+        assert resolved["exp_name"] == preset
 
+    class ToyModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layer = torch.nn.Linear(3, 2)
+            self.norm = torch.nn.LayerNorm(2)
+            self.gate = torch.nn.Parameter(torch.zeros(1))
+
+    model = ToyModel()
+    contrastive = torch.nn.Linear(2, 2)
+    optimizer = build_optimizer(model, contrastive, {"learning_rate": 5e-5, "weight_decay": 0.01})
+    grouped = [p for group in optimizer.param_groups for p in group["params"]]
+    expected = list(model.parameters()) + list(contrastive.parameters())
+    assert len(grouped) == len({id(p) for p in grouped})
+    assert {id(p) for p in grouped} == {id(p) for p in expected}
+    gates = next(group for group in optimizer.param_groups if group["group_name"] == "gates")
+    assert gates["lr"] == 5e-3
+    assert torch.isfinite(segmentation_loss(torch.randn(2, 2, 8, 8), torch.zeros(2, 8, 8, dtype=torch.long)))
+
+
+def test_ablation_manifest_filters_environment_and_supports_seven_presets():
+    safe = manifest_environment({"CC_SEED": "42", "CC_DECODE_WITH_LANG": "1", "SECRET": "omit"})
+    assert safe == {"CC_DECODE_WITH_LANG": "1", "CC_SEED": "42"}
+    assert build_env_for_preset("exp5_class_embedding")["CC_DECODE_WITH_LANG"] == "1"
     try:
-        GroupedStructureSampler(dataset, batch_size=2, shuffle=False)
+        build_env_for_preset("invalid")
     except ValueError:
         pass
     else:
-        raise AssertionError("contrastive sampler must reject incomplete structure batches")
+        raise AssertionError("unknown experiment must fail")
 
 
-def test_contrastive_loss_and_pooling():
-    feat = torch.randn(3, 4, 5, 5)
-    weights = torch.ones(3, 1, 5, 5)
-    pooled = weighted_pool(feat, weights, detach=True)
-    assert pooled.shape == (3, 4)
+def test_patient_statistics_and_paper_tables():
+    with tempfile.TemporaryDirectory() as tmp:
+        base = Path(tmp)
+        side_a = base / "condition_a_seed42" / "eval_test_canonical"
+        side_b = base / "condition_b_seed42" / "eval_test_canonical"
+        for directory, increment in ((side_a, 0.0), (side_b, 0.1)):
+            directory.mkdir(parents=True)
+            with (directory / "per_patient.csv").open("w", newline="", encoding="utf-8") as output:
+                writer = csv.DictWriter(output, fieldnames=(
+                    "patient", "structure_id", "structure", "dice", "hd95", "mad", "leakage"
+                ))
+                writer.writeheader()
+                for patient_index in range(4):
+                    writer.writerow({
+                        "patient": f"p{patient_index}",
+                        "structure_id": 1,
+                        "structure": "lv_endo",
+                        "dice": 0.6 + patient_index * 0.02 + increment,
+                        "hd95": 3.0 - increment,
+                        "mad": 1.0,
+                        "leakage": 0.05,
+                    })
+            (directory / "clinical.csv").write_text(
+                "patient,pred_ef_percent,gt_ef_percent\np0,55,60\np1,65,70\n",
+                encoding="utf-8",
+            )
 
-    loss_fn = ContrastiveAnatomicalLoss(4, proj_hidden_dim=8, proj_out_dim=4, tau=0.07)
-    features = torch.randn(3, 4, 3, 3)
-    logits = torch.randn(3, 2, 3, 3)
-    image_ids = torch.tensor([0, 0, 1])
-    structure_ids = torch.tensor([1, 2, 1])
-    loss, neg_cos, n = loss_fn(features, logits, image_ids, structure_ids, pool_region="pred")
-    assert torch.isfinite(loss)
-    assert n in (0, 1, 2, 3)
-    assert neg_cos.shape == ()
+        result = compare_runs([str(side_a.parent)], [str(side_b.parent)], min_patients=3, n_bootstrap=200)
+        assert result["status"] == "ok"
+        assert all(row["n_patients"] == 4 for row in result["results"])
+        assert all("holm_p" in row for row in result["results"])
+        insufficient = compare_runs([str(side_a.parent)], [str(side_b.parent)], min_patients=5, n_bootstrap=100)
+        assert insufficient["results"] == []
+        assert insufficient["status"] == "no comparisons met min_patients"
 
-    no_neg_loss, _, _ = loss_fn(features[:1], logits[:1], image_ids[:1], structure_ids[:1], pool_region="pred")
-    assert float(no_neg_loss.detach()) == 0.0
-
-
-def test_decoder_gate_zero_matches_baseline():
-    B, H, W = 2, 8, 8
-    x_c4 = torch.randn(B, 8, H, W)
-    x_c3 = torch.randn(B, 4, H // 2, W // 2)
-    x_c2 = torch.randn(B, 2, H // 4, W // 4)
-    x_c1 = torch.randn(B, 1, H // 8, W // 8)
-    lang = torch.randn(B, 768, 12)
-    mask = torch.ones(B, 12, 1, dtype=torch.long)
-
-    dec = SimpleDecoding(c4_dims=8, lang_dim=768, num_heads=4)
-    dec2 = SimpleDecoding(c4_dims=8, lang_dim=768, num_heads=4)
-    dec2.load_state_dict(dec.state_dict())
-    dec.ca_stage1.gate.data.zero_()
-    dec.ca_stage2.gate.data.zero_()
-    dec.ca_stage3.gate.data.zero_()
-    out_lang = dec(x_c4, x_c3, x_c2, x_c1, lang_feat=lang, lang_mask=mask)
-    out_plain = dec2(x_c4, x_c3, x_c2, x_c1)
-    assert out_lang.shape == out_plain.shape
-    assert torch.allclose(out_lang, out_plain, atol=1e-5, rtol=1e-5)
-
-
-def test_cross_attention_ignores_padding_tokens():
-    layer = DecoderCrossAttention(8, lang_dim=768, num_heads=2)
-    visual = torch.randn(2, 8, 5, 5)
-    lang = torch.randn(2, 768, 6)
-    mask = torch.tensor([[1, 1, 1, 0, 0, 0], [1, 1, 0, 0, 0, 0]], dtype=torch.long)
-    out = layer(visual, lang, mask.unsqueeze(-1))
-    assert out.shape == visual.shape
+        markdown, latex = make_tables([f"CardioContrast={base / 'condition_*'}"])
+        assert "CardioContrast" in markdown
+        assert "\\begin{tabular}" in latex
 
 
-def test_binary_metrics_known_square_and_empty():
-    from lib.metrics import binary_metrics
+def test_echonet_polygon_and_orientation_helpers():
+    rows = [{"Frame": 1, "X1": 1, "Y1": 1, "X2": 1, "Y2": 1}]
+    for x_left, x_right, y in ((20, 40, 20), (20, 40, 40), (20, 40, 60), (20, 40, 80)):
+        rows.append({"Frame": 1, "X1": x_left, "Y1": y, "X2": x_right, "Y2": y})
+    for x_left, x_right, y in ((25, 35, 30), (25, 35, 40), (25, 35, 50), (25, 35, 60)):
+        rows.append({"Frame": 2, "X1": x_left, "Y1": y, "X2": x_right, "Y2": y})
+    masks = build_tracing_masks(rows)
+    assert set(masks) == {1, 2}
+    assert masks[1].shape == (112, 112)
+    assert masks[1].sum() > masks[2].sum()
 
-    pred = np.zeros((20, 20), dtype=np.uint8)
-    pred[5:15, 5:15] = 1
-    gt = np.zeros_like(pred)
-    gt[5:15, 5:15] = 1
-    metrics = binary_metrics(pred, gt, spacing=(0.5, 0.5))
-    assert math.isfinite(metrics["dice"]) and metrics["dice"] > 0.9
-    assert metrics["empty_case"] is False
-
-    empty_pred = np.zeros((20, 20), dtype=np.uint8)
-    empty_gt = np.zeros((20, 20), dtype=np.uint8)
-    metrics_empty = binary_metrics(empty_pred, empty_gt, spacing=(0.5, 0.5))
-    assert metrics_empty["dice"] == 1.0
-    assert metrics_empty["empty_case"] is True
-
-
-def test_per_structure_metrics_summary():
-    from lib.metrics import per_structure_metrics
-
-    pred = np.zeros((10, 10), dtype=np.uint8)
-    gt = np.zeros((10, 10), dtype=np.uint8)
-    pred[2:8, 2:8] = 1
-    gt[2:8, 2:8] = 1
-    metrics = per_structure_metrics(pred, gt, structure_id=1)
-    assert metrics["dice"] > 0.9
-    assert metrics["structure_id"] == 1
-    assert metrics["empty_case"] is False
-
-
-def test_simpson_ellipse_volume_reasonable():
-    from lib.metrics import simpson_volume, ejection_fraction
-
-    # Half axes 20 and 10 px, with 20 discs over 2D ellipse area in a 2D plane.
-    area = math.pi * 20 * 10
-    vol = simpson_volume(np.ones((40, 40)), np.zeros((40, 40)), 1.0, 1.0)
-    assert np.isfinite(vol)
-    assert vol > 0
-    ef = ejection_fraction(100.0, 40.0)
-    assert abs(ef - 60.0) < 1e-6
+    array = np.arange(9).reshape(3, 3)
+    assert np.array_equal(orient(array, transpose=True), array.T)
+    assert np.array_equal(orient(array, flip_ud=True), np.flipud(array))
 
 
 if __name__ == "__main__":
-    test_split_and_prompts()
-    test_dataset_uses_patient_split_boundaries()
-    test_ablation_manifest_is_filtered_and_presets_are_explicit()
-    test_baseline_model_skips_text_encoder()
-    test_non_language_datasets_skip_tokenizer_loading()
-    test_patient_clustered_result_aggregation()
-    test_nifti_spacing_conversion_requires_units()
-    test_shared_grayscale_preprocessing_uses_channelwise_normalization()
-    test_grouped_sampler_keeps_structure_triplets_together()
-    test_contrastive_loss_and_pooling()
-    test_decoder_gate_zero_matches_baseline()
-    test_cross_attention_ignores_padding_tokens()
-    test_binary_metrics_known_square_and_empty()
-    test_simpson_ellipse_volume_reasonable()
+    test_split_and_prompt_protocol()
+    test_dataset_split_metadata_and_heldout_prompts()
+    test_dataset_augmentation_shared_and_seeded_by_epoch()
+    test_grouped_batch_sampler_contract()
+    test_contrastive_pooling_and_loss()
+    test_decoder_zero_gates_and_padding_mask()
+    test_cardio_model_class_embedding_forward()
+    test_metric_shapes_empty_leakage_and_spacing()
+    test_preprocessing_and_simpson_metrics()
+    test_patient_aggregates_and_report_outputs()
+    test_training_presets_and_optimizer_coverage()
+    test_ablation_manifest_filters_environment_and_supports_seven_presets()
+    test_patient_statistics_and_paper_tables()
+    test_echonet_polygon_and_orientation_helpers()
     print("ALL TESTS PASSED")

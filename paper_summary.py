@@ -2,9 +2,6 @@ import argparse
 import json
 from pathlib import Path
 
-import numpy as np
-
-
 def parse_metric_line(line):
     try:
         if "Mean IoU:" in line:

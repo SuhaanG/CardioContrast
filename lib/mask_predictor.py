@@ -89,21 +89,21 @@ class SimpleDecoding(nn.Module):
         return values
 
     def forward(self, x_c4, x_c3, x_c2, x_c1, lang_feat=None, lang_mask=None, return_features=False):
-        if x_c4.size(-2) > x_c3.size(-2) or x_c4.size(-1) > x_c3.size(-1):
+        if x_c4.shape[-2:] != x_c3.shape[-2:]:
             x_c4 = F.interpolate(x_c4, size=(x_c3.size(-2), x_c3.size(-1)), mode="bilinear", align_corners=True)
         x = torch.cat([x_c4, x_c3], dim=1)
         x = self.stage1(x)
         if lang_feat is not None:
             x = self.ca_stage1(x, lang_feat, lang_mask)
 
-        if x.size(-2) > x_c2.size(-2) or x.size(-1) > x_c2.size(-1):
+        if x.shape[-2:] != x_c2.shape[-2:]:
             x = F.interpolate(x, size=(x_c2.size(-2), x_c2.size(-1)), mode="bilinear", align_corners=True)
         x = torch.cat([x, x_c2], dim=1)
         x = self.stage2(x)
         if lang_feat is not None:
             x = self.ca_stage2(x, lang_feat, lang_mask)
 
-        if x.size(-2) > x_c1.size(-2) or x.size(-1) > x_c1.size(-1):
+        if x.shape[-2:] != x_c1.shape[-2:]:
             x = F.interpolate(x, size=(x_c1.size(-2), x_c1.size(-1)), mode="bilinear", align_corners=True)
         x = torch.cat([x, x_c1], dim=1)
         x = self.stage3(x)
