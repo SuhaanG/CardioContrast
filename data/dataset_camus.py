@@ -1,319 +1,242 @@
+"""
+data/dataset_camus.py — CAMUS dataset for prompt-conditioned binary segmentation.
+
+One sample = (image, one structure prompt) -> binary mask of that structure.
+Every image yields one sample per structure (3 samples), and the samples of an
+image are stored contiguously so the batch sampler can group them.
+
+Changes vs. the previous version:
+  * Split is by patient via data/splits.py (no test-set model selection).
+  * Returns case metadata (patient, view, phase, native size, pixel spacing,
+    image quality, reference EF) so evaluation can be done at NATIVE resolution
+    in millimetres and stratified the way CAMUS papers report results.
+  * Joint image/mask augmentation for training. The augmentation for an image is
+    seeded by (seed, epoch, image_idx), so the 3 prompts of the same image see
+    the SAME geometry -- required for the contrastive term to compare like with
+    like.
+  * Prompts are pre-tokenized once instead of per sample.
+  * Optional paraphrase prompts (train) and held-out paraphrases (eval).
+  * Returns `union` (all three structures) for the "union" contrastive pooling
+    variant and `class_id` for the learned-embedding language ablation.
+"""
+
 import glob
 import os
 import re
 
+import nibabel as nib
 import numpy as np
 import torch
-from PIL import Image
-from torch.utils import data
+import torch.nn.functional as F
+import torch.utils.data as data
+from torchvision.transforms import InterpolationMode
+from torchvision.transforms import functional as TF
 
-from .prompts import CANONICAL, HELDOUT, STRUCTURES, TRAIN_BANK
+from data.prompts import CANONICAL, HELDOUT, STRUCTURE_IDS, TRAIN_BANK
+from data.splits import get_split_patients
 
-FILENAME_RE = re.compile(r"(patient\d+)_(2CH|4CH)_(ED|ES)_gt\.nii(\.gz)?$")
+IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
 
-
-def spacing_to_mm(zooms, unit, assumed_unit=None):
-    if len(zooms) < 2 or any(not np.isfinite(value) or value <= 0 for value in zooms[:2]):
-        raise ValueError("NIfTI file has invalid in-plane pixel spacing")
-    if unit in {None, "", "unknown"}:
-        unit = assumed_unit
-    unit_to_mm = {"mm": 1.0, "meter": 1000.0, "micron": 0.001}
-    if unit not in unit_to_mm:
-        raise ValueError(f"Unsupported or missing NIfTI spatial unit: {unit!r}")
-    factor = unit_to_mm[unit]
-    return float(zooms[0] * factor), float(zooms[1] * factor)
+_NAME_RE = re.compile(r"(patient\d+)_(2CH|4CH)_(ED|ES)_gt\.nii(\.gz)?$")
 
 
-def index_images(data_dir, split):
-    from .splits import get_split_patients
-
-    allowed = set(get_split_patients(data_dir, split))
-    records = []
-    for mask_path in sorted(glob.glob(os.path.join(data_dir, "patient*", "*_gt.nii*")) + glob.glob(os.path.join(data_dir, "*_gt.nii*"))):
-        if "half_sequence" in mask_path:
-            continue
-        base = os.path.basename(mask_path)
-        m = FILENAME_RE.match(base)
-        if m is None:
-            continue
-        patient, view, phase, _ = m.groups()
-        if patient not in allowed:
-            continue
-        image_candidates = [
-            mask_path.replace("_gt.nii.gz", ".nii.gz"),
-            mask_path.replace("_gt.nii", ".nii"),
-            mask_path.replace("_gt.nii.gz", ".nii"),
-        ]
-        image_path = next((p for p in image_candidates if os.path.exists(p)), None)
-        if image_path is None:
-            continue
-        info = _read_info_cfg(os.path.join(os.path.dirname(mask_path), f"Info_{view}.cfg"))
-        records.append({
-            "image_path": image_path,
-            "mask_path": mask_path,
-            "patient": patient,
-            "view": view,
-            "phase": phase,
-            "case_id": f"{patient}_{view}",
-            "quality": info.get("imagequality", "unknown"),
-            "ref_ef": _find_ef(info),
-        })
-    return records
-
-
-def _read_info_cfg(path):
-    values = {}
+def parse_cfg(path):
+    """Parse a CAMUS Info_*.cfg file ('key: value' per line)."""
+    out = {}
     if not os.path.isfile(path):
-        return values
-    with open(path, "r", encoding="utf-8", errors="replace") as source:
-        for line in source:
-            if ":" not in line:
-                continue
-            key, value = line.split(":", 1)
-            values[key.strip().lower()] = value.strip()
-    return values
+        return out
+    with open(path) as f:
+        for line in f:
+            if ":" in line:
+                k, v = line.split(":", 1)
+                out[k.strip()] = v.strip()
+    return out
 
 
-def _find_ef(info):
-    for key in ("ef", "lvef", "lvef", "lvejectionfraction"):
-        value = info.get(key)
-        if value:
-            match = re.search(r"[-+]?\d+(?:\.\d+)?", value)
-            if match:
-                return float(match.group())
-    return None
+def load_nifti_2d(path):
+    img = nib.load(path)
+    arr = np.squeeze(np.asarray(img.dataobj))
+    spacing = tuple(float(z) for z in img.header.get_zooms()[:2])
+    return arr, spacing
 
 
-def preprocess_grayscale_image(image, img_size):
-    image = np.asarray(image, dtype=np.float32)
-    max_value = float(np.max(image)) if image.size else 0.0
-    if max_value > 0:
-        image = image / max_value * 255.0
-    image_rgb = np.repeat(image.astype(np.uint8)[:, :, None], 3, axis=2)
-    image_pil = Image.fromarray(image_rgb).resize((img_size, img_size), Image.BILINEAR)
-    image_arr = np.asarray(image_pil, dtype=np.float32) / 255.0
-    mean = np.asarray((0.485, 0.456, 0.406), dtype=np.float32).reshape(1, 1, 3)
-    std = np.asarray((0.229, 0.224, 0.225), dtype=np.float32).reshape(1, 1, 3)
-    normalized = ((image_arr - mean) / std).transpose(2, 0, 1).copy()
-    return torch.from_numpy(normalized)
+
+def index_images(data_dir, split, verbose=True):
+    """List the ED/ES images of a split with metadata (no tokenizer needed)."""
+    patients = get_split_patients(data_dir, split, verbose=verbose)
+    images = []
+    for gt_path in sorted(glob.glob(os.path.join(data_dir, "patient*", "*_gt.nii*"))):
+        m = _NAME_RE.search(os.path.basename(gt_path))
+        if m is None:           # skips half_sequence and anything unexpected
+            continue
+        patient, view, phase = m.group(1), m.group(2), m.group(3)
+        if patient not in patients:
+            continue
+        img_path = gt_path.replace("_gt.nii", ".nii")
+        if not os.path.exists(img_path):
+            continue
+        cfg = parse_cfg(os.path.join(os.path.dirname(gt_path), "Info_{}.cfg".format(view)))
+        try:
+            ref_ef = float(cfg["EF"]) if "EF" in cfg else float("nan")
+        except ValueError:
+            ref_ef = float("nan")
+        images.append({
+            "image_path": img_path, "mask_path": gt_path,
+            "patient": patient, "view": view, "phase": phase,
+            "case": "{}_{}_{}".format(patient, view, phase),
+            "quality": cfg.get("ImageQuality", "NA"),
+            "ref_ef": ref_ef,
+        })
+    return images
 
 
 class CAMUSDataset(data.Dataset):
-    def __init__(self, data_dir, split="train", img_size=352, prompt_mode="fixed", eval_prompt_set="canonical", seed=42, epoch=0, use_language=True, bert_tokenizer="bert-base-uncased", spacing_unit="", augment=True, max_images=None):
+    def __init__(self, data_dir, split, img_size=352, tokenizer_path="bert-base-uncased",
+                 max_tokens=20, augment=False, prompt_mode="fixed",
+                 eval_prompt_set="canonical", seed=42, max_images=None):
+        """
+        Args:
+            split:           'train' | 'val' | 'test'
+            prompt_mode:     'fixed' (canonical prompt) or 'paraphrase'
+                             (random TRAIN_BANK prompt per sample; train only)
+            eval_prompt_set: which prompts to enumerate when not paraphrasing:
+                             'canonical' -> 1 prompt per structure
+                             'heldout'   -> every HELDOUT paraphrase
+        """
+        assert prompt_mode in ("fixed", "paraphrase")
+        assert eval_prompt_set in ("canonical", "heldout")
         self.data_dir = data_dir
         self.split = split
         self.img_size = img_size
+        self.max_tokens = max_tokens
+        self.augment = augment
         self.prompt_mode = prompt_mode
-        self.eval_prompt_set = eval_prompt_set
         self.seed = seed
-        self.epoch = epoch
-        self.use_language = use_language
-        self.bert_tokenizer = bert_tokenizer
-        self.spacing_unit = spacing_unit
-        self.augment = bool(augment and split == "train")
-        if prompt_mode not in {"fixed", "paraphrase"}:
-            raise ValueError(f"Unknown prompt_mode={prompt_mode!r}")
-        if prompt_mode == "paraphrase" and split != "train":
-            raise ValueError("Paraphrase prompt mode is only valid for training")
-        if eval_prompt_set not in {"canonical", "heldout"}:
-            raise ValueError(f"Unknown eval_prompt_set={eval_prompt_set!r}")
-        if split == "train" and eval_prompt_set != "canonical":
-            raise ValueError("eval_prompt_set is only valid for evaluation splits")
-        self.records = index_images(data_dir, split)
-        if max_images is not None:
-            if int(max_images) < 1:
-                raise ValueError("max_images must be positive")
-            self.records = self.records[:int(max_images)]
-        self._spacing_cache = {}
-        self.samples = []
-        for i, record in enumerate(self.records):
-            for structure in sorted(STRUCTURES):
-                prompts = HELDOUT[structure] if split != "train" and eval_prompt_set == "heldout" else (CANONICAL[structure],)
-                for prompt_k in range(len(prompts)):
-                    self.samples.append({
-                        "record": record,
-                        "structure": structure,
-                        "image_idx": i,
-                        "prompt_k": prompt_k,
-                    })
-        self.tokenizer = None
-        self._prompt_tokens = self._pretokenize_prompts()
-        self._init_tokenizer()
+        self.epoch = 0
 
-    def _init_tokenizer(self):
-        if not self.use_language:
-            return
         from transformers import BertTokenizer
+        self.tokenizer = BertTokenizer.from_pretrained(tokenizer_path)
 
-        self.tokenizer = BertTokenizer.from_pretrained(self.bert_tokenizer)
-        self._prompt_tokens = self._pretokenize_prompts()
+        self.images = index_images(data_dir, split)
+        if len(self.images) == 0:
+            raise ValueError("No CAMUS images found for split '{}' in {}".format(split, data_dir))
+        if max_images is not None:          # smoke tests only
+            self.images = self.images[:max_images]
 
-    def _all_prompts(self):
-        prompts = set(CANONICAL.values())
-        prompts.update(prompt for bank in TRAIN_BANK.values() for prompt in bank)
-        prompts.update(prompt for bank in HELDOUT.values() for prompt in bank)
-        return prompts
+        # Prompt table per structure.
+        if eval_prompt_set == "heldout":
+            self.prompt_table = {s: list(HELDOUT[s]) for s in STRUCTURE_IDS}
+        else:
+            self.prompt_table = {s: [CANONICAL[s]] for s in STRUCTURE_IDS}
 
-    def _pretokenize_prompts(self):
-        if not self.use_language or self.tokenizer is None:
-            return {}
-        return {
-            prompt: self.tokenizer(
-                prompt,
-                return_tensors="pt",
-                padding="max_length",
-                truncation=True,
-                max_length=32,
-            )
-            for prompt in self._all_prompts()
-        }
+        # samples: (image_idx, structure_id, prompt_k). Contiguous per image.
+        self.samples = []
+        for i in range(len(self.images)):
+            for s in STRUCTURE_IDS:
+                for k in range(len(self.prompt_table[s])):
+                    self.samples.append((i, s, k))
 
-    def _encode_prompt(self, prompt):
-        if self.tokenizer is None:
-            input_ids = torch.zeros(32, dtype=torch.long)
-            attn_mask = torch.zeros(32, dtype=torch.long)
-            return input_ids, attn_mask
-        encoded = self._prompt_tokens[prompt]
-        return encoded["input_ids"][0].clone(), encoded["attention_mask"][0].clone()
+        all_prompts = set(CANONICAL.values())
+        for s in STRUCTURE_IDS:
+            all_prompts |= set(TRAIN_BANK[s]) | set(HELDOUT[s])
+        self._tok = {p: self._tokenize(p) for p in all_prompts}
 
+    def _tokenize(self, sentence):
+        ids = self.tokenizer.encode(text=sentence, add_special_tokens=True)[: self.max_tokens]
+        input_ids = torch.zeros(self.max_tokens, dtype=torch.long)
+        attn = torch.zeros(self.max_tokens, dtype=torch.long)
+        input_ids[: len(ids)] = torch.tensor(ids)
+        attn[: len(ids)] = 1
+        return input_ids, attn
+
+    # ------------------------------------------------------------- utilities
     def set_epoch(self, epoch):
+        """Call once per epoch (before building the iterator) so augmentation varies."""
         self.epoch = epoch
 
-    def _load_nifti_2d(self, path):
-        import nibabel as nib
+    def image_groups(self):
+        """Map image_idx -> list of sample indices (used by the batch sampler)."""
+        groups = {}
+        for n, (i, _, _) in enumerate(self.samples):
+            groups.setdefault(i, []).append(n)
+        return groups
 
-        arr = np.asarray(nib.load(path).get_fdata())
-        return np.squeeze(arr).astype(np.float32)
-
-    def get_pixel_spacing(self, path, assumed_unit=None):
-        import nibabel as nib
-
-        if path in self._spacing_cache:
-            return self._spacing_cache[path]
-        header = nib.load(path).header
-        spacing = spacing_to_mm(
-            header.get_zooms(),
-            header.get_xyzt_units()[0],
-            assumed_unit=assumed_unit or self.spacing_unit,
-        )
-        self._spacing_cache[path] = spacing
-        return spacing
-
-    def _resolve_prompt(self, structure, image_idx, prompt_k=0):
-        if self.prompt_mode == "fixed":
-            if self.split != "train" and self.eval_prompt_set == "heldout":
-                return HELDOUT[structure][prompt_k]
-            return CANONICAL[structure]
-        if self.prompt_mode == "paraphrase":
-            rng = np.random.default_rng([self.seed, self.epoch, image_idx, structure])
-            bank = TRAIN_BANK[structure]
-            return bank[int(rng.integers(0, len(bank)))]
-        raise ValueError(f"Unknown prompt_mode={self.prompt_mode!r}")
-
-    def _augment_image_and_mask(self, image, mask, image_idx):
-        rng = np.random.default_rng([self.seed, self.epoch, image_idx])
-        height, width = image.shape
-        angle = float(rng.uniform(-10.0, 10.0))
-        scale = float(rng.uniform(0.9, 1.1))
-        translate = (
-            int(round(rng.uniform(-0.05, 0.05) * width)),
-            int(round(rng.uniform(-0.05, 0.05) * height)),
-        )
-        image = np.asarray(image, dtype=np.float32)
-        maximum = float(image.max()) if image.size else 0.0
-        image = image / maximum if maximum > 0 else image
-        image_pil = Image.fromarray(image, mode="F")
-        mask_pil = Image.fromarray(np.asarray(mask, dtype=np.uint8))
-        radians = np.deg2rad(angle)
-        cosine = float(np.cos(radians) / scale)
-        sine = float(np.sin(radians) / scale)
-        center_x, center_y = width / 2.0, height / 2.0
-        translate_x, translate_y = translate
-        affine = (
-            cosine,
-            sine,
-            center_x - cosine * (center_x + translate_x) - sine * (center_y + translate_y),
-            -sine,
-            cosine,
-            center_y + sine * (center_x + translate_x) - cosine * (center_y + translate_y),
-        )
-        image_pil = image_pil.transform(
-            (width, height), Image.Transform.AFFINE, affine,
-            resample=Image.Resampling.BILINEAR, fillcolor=0.0,
-        )
-        mask_pil = mask_pil.transform(
-            (width, height), Image.Transform.AFFINE, affine,
-            resample=Image.Resampling.NEAREST, fillcolor=0,
-        )
-
-        intensity_rng = np.random.default_rng([self.seed, self.epoch, image_idx, 7919])
-        gamma = float(intensity_rng.uniform(0.8, 1.25))
-        contrast = float(intensity_rng.uniform(0.85, 1.15))
-        brightness = float(intensity_rng.uniform(-0.08, 0.08))
-        image_arr = np.asarray(image_pil, dtype=np.float32)
-        image_arr = np.power(np.clip(image_arr, 0.0, None), gamma)
-        image_mean = float(image_arr.mean())
-        image_arr = (image_arr - image_mean) * contrast + image_mean
-        image_arr = np.clip(image_arr + brightness, 0.0, None)
-        return image_arr, np.asarray(mask_pil, dtype=np.uint8)
+    def load_full_res(self, image_idx):
+        """Native-resolution multi-label GT mask and pixel spacing (mm)."""
+        mask, spacing = load_nifti_2d(self.images[image_idx]["mask_path"])
+        return mask.astype(np.uint8), spacing
 
     def __len__(self):
         return len(self.samples)
 
+    # ------------------------------------------------------------ transforms
+    def _augment(self, img, mask, rng):
+        """img: (1,S,S) float in [0,1]; mask: (1,S,S) uint8 multi-label."""
+        angle = float(rng.uniform(-10, 10))
+        scale = float(rng.uniform(0.9, 1.1))
+        tx = int(round(rng.uniform(-0.05, 0.05) * self.img_size))
+        ty = int(round(rng.uniform(-0.05, 0.05) * self.img_size))
+        img = TF.affine(img, angle=angle, translate=[tx, ty], scale=scale, shear=[0.0],
+                        interpolation=InterpolationMode.BILINEAR)
+        mask = TF.affine(mask, angle=angle, translate=[tx, ty], scale=scale, shear=[0.0],
+                         interpolation=InterpolationMode.NEAREST)
+        gamma = float(rng.uniform(0.8, 1.25))
+        contrast = float(rng.uniform(0.85, 1.15))
+        brightness = float(rng.uniform(-0.08, 0.08))
+        img = img.clamp(0, 1) ** gamma
+        img = ((img - img.mean()) * contrast + img.mean() + brightness).clamp(0, 1)
+        return img, mask
+
     def __getitem__(self, index):
-        sample = self.samples[index]
-        record = sample["record"]
-        structure = sample["structure"]
-        image_idx = sample["image_idx"]
-        prompt = self._resolve_prompt(structure, image_idx, sample["prompt_k"])
+        image_idx, structure, prompt_k = self.samples[index]
+        rec = self.images[image_idx]
 
-        image = self._load_nifti_2d(record["image_path"])
-        mask = self._load_nifti_2d(record["mask_path"])
+        image, spacing = load_nifti_2d(rec["image_path"])
+        mask, _ = load_nifti_2d(rec["mask_path"])
+        orig_h, orig_w = image.shape
+
+        image = image.astype(np.float32)
+        image = image / image.max() if image.max() > 0 else image
+        img_t = torch.from_numpy(image)[None, None]                      # (1,1,H,W)
+        img_t = F.interpolate(img_t, size=(self.img_size, self.img_size),
+                              mode="bilinear", align_corners=False, antialias=True)[0]
+        mask_t = torch.from_numpy(mask.astype(np.uint8))[None, None].float()
+        mask_t = F.interpolate(mask_t, size=(self.img_size, self.img_size),
+                               mode="nearest")[0].to(torch.uint8)
+
+        # Same augmentation for all prompts of an image within an epoch.
+        rng = np.random.default_rng([self.seed, self.epoch, image_idx])
         if self.augment:
-            image, mask = self._augment_image_and_mask(image, mask, image_idx)
-        image_tensor = preprocess_grayscale_image(image, self.img_size)
-        foreground = np.zeros_like(mask, dtype=np.uint8)
-        foreground[mask == structure] = 1
+            img_t, mask_t = self._augment(img_t, mask_t, rng)
 
-        target = np.asarray(Image.fromarray(foreground.astype(np.uint8)).resize((self.img_size, self.img_size), Image.NEAREST), dtype=np.float32)
-        union = np.asarray(Image.fromarray((mask > 0).astype(np.uint8)).resize((self.img_size, self.img_size), Image.NEAREST), dtype=np.float32)
+        img_t = (img_t.repeat(3, 1, 1) - IMAGENET_MEAN) / IMAGENET_STD
+        mask_t = mask_t[0].long()
+        target = (mask_t == structure).long()
+        union = (mask_t > 0).float()
 
-        input_ids, attn_mask = self._encode_prompt(prompt)
+        if self.prompt_mode == "paraphrase" and self.split == "train":
+            # Independent draw per (image, structure) so prompts vary within an image.
+            prng = np.random.default_rng([self.seed, self.epoch, image_idx, structure])
+            prompt = TRAIN_BANK[structure][int(prng.integers(len(TRAIN_BANK[structure])))]
+        else:
+            prompt = self.prompt_table[structure][prompt_k]
+        input_ids, attn = self._tok[prompt]
+
         return {
-            "image": image_tensor,
-            "target": torch.from_numpy(target),
-            "union": torch.from_numpy(union),
+            "image": img_t,
+            "target": target,
+            "union": union,
             "input_ids": input_ids,
-            "attn_mask": attn_mask,
+            "attn_mask": attn,
             "class_id": torch.tensor(structure - 1, dtype=torch.long),
-            "structure": structure,
+            "structure": torch.tensor(structure, dtype=torch.long),
             "image_idx": torch.tensor(image_idx, dtype=torch.long),
             "prompt": prompt,
-            "patient": record["patient"],
-            "case_id": record["case_id"],
-            "view": record["view"],
-            "phase": record["phase"],
-            "quality": record["quality"],
-            "ref_ef": float("nan") if record["ref_ef"] is None else record["ref_ef"],
-            "orig_size": image.shape,
-            "spacing": np.asarray(self.get_pixel_spacing(record["mask_path"]), dtype=np.float32),
+            "patient": rec["patient"],
+            "view": rec["view"],
+            "phase": rec["phase"],
+            "quality": rec["quality"],
+            "orig_size": torch.tensor([orig_h, orig_w], dtype=torch.long),
+            "spacing": torch.tensor(spacing, dtype=torch.float32),
         }
-
-    def load_full_res(self, image_idx):
-        record = self.records[image_idx]
-        mask = self._load_nifti_2d(record["mask_path"])
-        spacing = np.asarray(self.get_pixel_spacing(record["mask_path"]), dtype=np.float32)
-        return mask, spacing
-
-    def image_groups(self):
-        groups = {}
-        for idx, sample in enumerate(self.samples):
-            groups.setdefault(sample["image_idx"], []).append(idx)
-        return groups
-
-    @property
-    def max_images(self):
-        return len(self.records)
-
-
-__all__ = ["CAMUSDataset", "index_images"]

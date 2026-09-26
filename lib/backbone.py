@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint as checkpoint
 import numpy as np
-from timm.layers import DropPath, to_2tuple, trunc_normal_
+from timm.models.layers import DropPath, to_2tuple, trunc_normal_
 from .mmcv_custom import load_checkpoint
 import logging
 def get_root_logger(log_level=logging.INFO): return logging.getLogger(__name__)

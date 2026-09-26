@@ -1,4 +1,43 @@
-"""Contrastive anatomical repulsion loss for CardioContrast."""
+"""
+lib/contrastive.py — Contrastive anatomical repulsion loss.
+
+For an anchor (image i, structure a), negatives are (image i, structure b != a).
+
+    L = (1/|A|) sum_{i in A} (1/|N(i)|) sum_{j in N(i)} tau * softplus( <z_i, z_j> / tau )
+
+where A = anchors that have at least one negative (write |A| in Eq. 9, not |B|).
+
+Scale fix: the old loss summed softplus(sim/tau) with tau = 0.07, so a collapsed
+pair (cos ~ 0.95) cost ~13.6 per pair (~27 per anchor) -- with lambda = 0.1 the
+repulsion term was ~2x the segmentation loss at the start of training and
+lambda was not interpretable. Multiplying by tau makes the per-pair loss a
+smooth ReLU of the cosine (~cos when positive, ~0 when negative), bounded by 1,
+and independent of tau's scale; averaging over N(i) makes it independent of
+the number of structures. lambda must then be tuned on VAL (e.g. 0.1/0.3/1.0).
+
+Changes vs. the previous version:
+  * Pooling region is configurable (--pool_region), because the choice changes
+    what the loss means:
+      'pred'  : weight by the predicted foreground probability (paper default).
+                Different prompts pool DIFFERENT pixels, so features can differ
+                simply because the regions differ -- a reviewer can call this
+                trivially satisfiable.
+      'gt'    : weight by the ground-truth mask of the prompted structure.
+                Stable early in training when predictions are still noise.
+      'union' : weight by the union of all three structures, IDENTICAL for all
+                prompts of the same image. The loss then forces prompt-
+                conditioned features at the SAME pixels to diverge -- the
+                cleanest operationalisation of "disambiguation". Recommended
+                ablation; if it wins, make it the main method.
+  * detach_weights (default True): the pooling weights are detached, so the
+    repulsion term can only change features, not reshape the predicted masks
+    to make the loss smaller. The old code let gradients flow into the mask.
+  * Projection head uses LayerNorm instead of BatchNorm1d. With 3 samples per
+    batch (one image x 3 prompts), BatchNorm statistics over 3 vectors are
+    extremely noisy. Update the paper text ("batch normalization") to match.
+  * Returns diagnostics (mean cosine similarity of negative pairs) so the paper
+    can show the loss actually separates representations.
+"""
 
 import torch
 import torch.nn as nn
@@ -20,93 +59,52 @@ class ProjectionHead(nn.Module):
         return self.net(x)
 
 
-def weighted_pool(features, weights=None, detach=True):
-    if weights is None:
-        weights = torch.ones_like(features[:, :1, :, :])
-    if weights.dim() == 3:
-        weights = weights.unsqueeze(1)
+def weighted_pool(features, weights, eps=1e-6):
+    """features: (B,C,h,w); weights: (B,1,H,W) in [0,1] -> (B,C)."""
     if weights.shape[-2:] != features.shape[-2:]:
-        weights = F.interpolate(weights, size=features.shape[-2:], mode="bilinear", align_corners=True)
-    if detach and weights.requires_grad:
-        weights = weights.detach()
-    if weights.shape[1] == 1 and features.shape[1] > 1:
-        weights = weights.expand(-1, features.shape[1], -1, -1)
-    weight_sum = weights.sum(dim=(-1, -2)).clamp_min(1e-6)
-    pooled = (features * weights).sum(dim=(-1, -2)) / weight_sum
-    return pooled
+        weights = F.interpolate(weights, size=features.shape[-2:], mode="bilinear",
+                                align_corners=False)
+    num = (features * weights).sum(dim=(-2, -1))
+    den = weights.sum(dim=(-2, -1)).clamp(min=eps)
+    return num / den
 
 
-def masked_average_pool(features, mask_logits):
-    return weighted_pool(features, torch.softmax(mask_logits, dim=1)[:, 1:2], detach=True)
-
-
-def contrastive_repulsion_loss(embeddings, image_ids, structure_ids, tau=0.07):
-    if tau <= 0:
-        raise ValueError("tau must be positive")
-    embeddings = F.normalize(embeddings, dim=1)
-    device = embeddings.device
-    sim = embeddings @ embeddings.T
-
-    image_ids = image_ids.to(device)
-    structure_ids = structure_ids.to(device)
-    if embeddings.size(0) < 2:
-        zero = embeddings.sum() * 0.0
-        return zero, zero, 0
-
-    neg_losses = []
-    neg_cosines = []
-    valid = 0
-    for i in range(embeddings.size(0)):
-        same_image = image_ids == image_ids[i]
-        same_structure = structure_ids == structure_ids[i]
-        neg_idx = torch.nonzero(same_image & (~same_structure), as_tuple=False).flatten()
-        if neg_idx.numel() == 0:
-            continue
-        valid += 1
-        neg_sims = sim[i, neg_idx] / tau
-        neg_losses.append((tau * F.softplus(neg_sims)).mean())
-        neg_cosines.append(F.cosine_similarity(embeddings[i].unsqueeze(0), embeddings[neg_idx]).mean())
-
-    if not neg_losses:
-        zero = embeddings.sum() * 0.0
-        return zero, zero.detach(), 0
-
-    loss = torch.stack(neg_losses).mean()
-    neg_cos = torch.stack(neg_cosines).mean() if neg_cosines else torch.zeros((), device=device)
-    return loss, neg_cos, valid
+def anatomical_repulsion_loss(z, image_ids, structure_ids, tau=0.07):
+    """z: (B,D) L2-normalised. Returns (loss, mean_negative_cosine, n_anchors)."""
+    sim = z @ z.t()
+    same_img = image_ids[:, None] == image_ids[None, :]
+    diff_struct = structure_ids[:, None] != structure_ids[None, :]
+    neg = same_img & diff_struct
+    has_neg = neg.any(dim=1)
+    if not has_neg.any():
+        zero = z.sum() * 0.0
+        return zero, float("nan"), 0
+    per_pair = tau * F.softplus(sim / tau) * neg
+    per_anchor = per_pair.sum(dim=1)[has_neg] / neg.sum(dim=1)[has_neg]
+    loss = per_anchor.mean()
+    mean_cos = sim[neg].mean().item()
+    return loss, mean_cos, int(has_neg.sum().item())
 
 
 class ContrastiveAnatomicalLoss(nn.Module):
-    def __init__(self, in_dim, proj_hidden_dim=None, proj_out_dim=128, tau=0.07):
+    def __init__(self, in_dim, proj_hidden_dim=None, proj_out_dim=128, tau=0.07,
+                 pool_region="pred", detach_weights=True):
         super().__init__()
+        assert pool_region in ("pred", "gt", "union")
         self.projection_head = ProjectionHead(in_dim, proj_hidden_dim, proj_out_dim)
         self.tau = tau
+        self.pool_region = pool_region
+        self.detach_weights = detach_weights
 
-    def forward(self, features, mask_logits, image_ids, structure_ids,
-                pool_region="pred", gt_masks=None, union_masks=None,
-                detach_pooling=True):
-        if pool_region == "pred":
-            weights = torch.softmax(mask_logits, dim=1)[:, 1:2]
-        elif pool_region == "gt":
-            if gt_masks is None:
-                raise ValueError("gt_masks are required for pool_region='gt'")
-            weights = gt_masks
-        elif pool_region == "union":
-            if union_masks is None:
-                raise ValueError("union_masks are required for pool_region='union'")
-            weights = union_masks
+    def forward(self, features, logits, image_ids, structure_ids, target=None, union=None):
+        if self.pool_region == "pred":
+            w = torch.softmax(logits.float(), dim=1)[:, 1:2]
+        elif self.pool_region == "gt":
+            w = target.unsqueeze(1).float()
         else:
-            raise ValueError(f"Unknown pool_region={pool_region!r}")
-        pooled = weighted_pool(features, weights, detach=detach_pooling)
-        projected = self.projection_head(pooled)
-        loss, neg_cos, n_anchors = contrastive_repulsion_loss(projected, image_ids, structure_ids, self.tau)
-        return loss, neg_cos, n_anchors
-
-
-__all__ = [
-    "ProjectionHead",
-    "weighted_pool",
-    "masked_average_pool",
-    "contrastive_repulsion_loss",
-    "ContrastiveAnatomicalLoss",
-]
+            w = union.unsqueeze(1).float()
+        if self.detach_weights:
+            w = w.detach()
+        pooled = weighted_pool(features.float(), w)
+        z = F.normalize(self.projection_head(pooled), dim=1)
+        return anatomical_repulsion_loss(z, image_ids, structure_ids, self.tau)

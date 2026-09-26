@@ -1,144 +1,54 @@
+"""
+config.py — Paths and defaults. Every value here can be overridden from the
+command line of train_cardiocontrast.py / evaluate.py, so nobody needs to edit
+this file between experiments (the old workflow of hand-editing flags before
+each run is how ablation runs get mislabeled).
+"""
+
 import os
-import subprocess
 
-import torch
+# ---------------------------------------------------------------- paths
+CAMUS_DATA_DIR = os.environ.get("CAMUS_DATA_DIR",
+                                "/content/CAMUS_public/CAMUS_public/database_nifti")
+ECHONET_DATA_DIR = os.environ.get("ECHONET_DATA_DIR", "/content/EchoNet-Dynamic")
+PRETRAINED_SWIN = os.environ.get(
+    "PRETRAINED_SWIN",
+    "/content/CardioContrast/pretrained_weights/swin_base_patch4_window12_384_22k.pth")
+BERT_PATH = os.environ.get("BERT_PATH", "bert-base-uncased")   # or a local folder
+OUTPUT_ROOT = os.environ.get("CC_OUTPUT_ROOT", "/content/CardioContrast/experiments")
 
-CAMUS_DATA_DIR = os.environ.get("CAMUS_DATA_DIR", os.path.join("data", "CAMUS"))
-ECHONET_DATA_DIR = os.environ.get("ECHONET_DATA_DIR", os.path.join("data", "EchoNet"))
-PRETRAINED_SWIN = os.environ.get("PRETRAINED_SWIN", "")
-BERT_PATH = os.environ.get("BERT_PATH", "bert-base-uncased")
-CC_OUTPUT_ROOT = os.environ.get("CC_OUTPUT_ROOT", os.path.join("outputs", "cardiocontrast"))
+# ---------------------------------------------------------------- defaults
+IMG_SIZE = 352
+SWIN_TYPE = "base"
+WINDOW_SIZE = 12
 
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+IMAGES_PER_BATCH = 2          # batch = IMAGES_PER_BATCH x 3 prompts = 6 samples
+GRAD_ACCUM_STEPS = 2          # effective batch = 12 samples (same as before)
+LR = 5e-5
+WEIGHT_DECAY = 1e-2
+EPOCHS = 40
+WARMUP_STEPS = 500
+SEED = 42
 
-DEFAULTS = {
-    "seed": 42,
-    "epochs": 40,
-    "img_size": 352,
-    "batch_size": 3,
-    "grad_accum_steps": 2,
-    "learning_rate": 5e-5,
-    "weight_decay": 1e-2,
-    "swin_type": "base",
-    "window_size": 7,
-    "decode_with_lang": True,
-    "contrastive_weight": 0.1,
-    "contrastive_tau": 0.07,
-    "contrastive_pool_region": "pred",
-    "bert_trainable_layers": 10,
-    "embed_tokens": 8,
-    "images_per_batch": 2,
-}
+CONTRASTIVE_TAU = 0.07
+CONTRASTIVE_WEIGHT = 0.1
+BERT_TRAINABLE_LAYERS = 10
 
+# Ablation presets. Every preset uses the SAME sampler, loss, augmentation and
+# schedule; only the listed fields differ.
 PRESETS = {
-    "exp1_baseline": {"decode_with_lang": False, "contrastive_weight": 0.0, "exp_name": "exp1_baseline"},
-    "exp2_decoder_ca": {"decode_with_lang": True, "contrastive_weight": 0.0, "exp_name": "exp2_decoder_ca"},
-    "exp3_contrastive": {"decode_with_lang": False, "contrastive_weight": 0.1, "exp_name": "exp3_contrastive"},
-    "exp4_cardiocontrast": {"decode_with_lang": True, "contrastive_weight": 0.1, "exp_name": "exp4_cardiocontrast"},
-    "exp5_class_embedding": {"decode_with_lang": True, "contrastive_weight": 0.1, "text_encoder": "embedding", "exp_name": "exp5_class_embedding"},
-    "exp6_paraphrase": {"decode_with_lang": True, "contrastive_weight": 0.1, "prompt_mode": "paraphrase", "exp_name": "exp6_paraphrase"},
-    "exp7_union_pool": {"decode_with_lang": True, "contrastive_weight": 0.1, "contrastive_pool_region": "union", "exp_name": "exp7_union_pool"},
+    # core 2x2 ablation
+    "exp1_baseline":        dict(decode_with_lang=0, contrastive_weight=0.0),
+    "exp2_decoder_ca":      dict(decode_with_lang=1, contrastive_weight=0.0),
+    "exp3_contrastive":     dict(decode_with_lang=0, contrastive_weight=CONTRASTIVE_WEIGHT),
+    "exp4_cardiocontrast":  dict(decode_with_lang=1, contrastive_weight=CONTRASTIVE_WEIGHT),
+    # does language matter? (same as exp4 but the text pathway is a class lookup table)
+    "exp5_class_embedding": dict(decode_with_lang=1, contrastive_weight=CONTRASTIVE_WEIGHT,
+                                 text_encoder="embedding"),
+    # language generalisation: train on paraphrases, test on held-out paraphrases
+    "exp6_paraphrase":      dict(decode_with_lang=1, contrastive_weight=CONTRASTIVE_WEIGHT,
+                                 prompt_mode="paraphrase"),
+    # pool on the union of structures (same pixels for every prompt)
+    "exp7_union_pool":      dict(decode_with_lang=1, contrastive_weight=CONTRASTIVE_WEIGHT,
+                                 pool_region="union"),
 }
-
-SEED = int(os.environ.get("CC_SEED", DEFAULTS["seed"]))
-EPOCHS = int(os.environ.get("CC_EPOCHS", DEFAULTS["epochs"]))
-IMG_SIZE = int(os.environ.get("CC_IMG_SIZE", DEFAULTS["img_size"]))
-BATCH_SIZE = int(os.environ.get("CC_BATCH_SIZE", DEFAULTS["batch_size"]))
-GRADIENT_ACCUMULATION_STEPS = int(os.environ.get("CC_GRAD_ACCUM_STEPS", DEFAULTS["grad_accum_steps"]))
-LR = float(os.environ.get("CC_LR", DEFAULTS["learning_rate"]))
-WEIGHT_DECAY = float(os.environ.get("CC_WEIGHT_DECAY", DEFAULTS["weight_decay"]))
-SWIN_TYPE = os.environ.get("CC_SWIN_TYPE", DEFAULTS["swin_type"])
-WINDOW_SIZE = int(os.environ.get("CC_WINDOW_SIZE", DEFAULTS["window_size"]))
-if WINDOW_SIZE < 1:
-    raise ValueError("CC_WINDOW_SIZE must be positive")
-SPACING_UNIT = os.environ.get("CC_SPACING_UNIT", "").strip().lower()
-DECODE_WITH_LANG = bool(int(os.environ.get("CC_DECODE_WITH_LANG", int(DEFAULTS["decode_with_lang"]))))
-CONTRASTIVE_WEIGHT = float(os.environ.get("CC_CONTRASTIVE_WEIGHT", DEFAULTS["contrastive_weight"]))
-CONTRASTIVE_TAU = float(os.environ.get("CC_CONTRASTIVE_TAU", DEFAULTS["contrastive_tau"]))
-CONTRASTIVE_POOL_REGION = os.environ.get("CC_CONTRASTIVE_POOL_REGION", DEFAULTS["contrastive_pool_region"])
-if CONTRASTIVE_POOL_REGION not in {"pred", "gt", "union"}:
-    raise ValueError("CC_CONTRASTIVE_POOL_REGION must be pred, gt, or union")
-BERT_TRAINABLE_LAYERS = int(os.environ.get("CC_BERT_TRAINABLE_LAYERS", DEFAULTS["bert_trainable_layers"]))
-EMBED_TOKENS = int(os.environ.get("CC_EMBED_TOKENS", DEFAULTS["embed_tokens"]))
-IMAGES_PER_BATCH = int(os.environ.get("CC_IMAGES_PER_BATCH", DEFAULTS["images_per_batch"]))
-CHECKPOINT_DIR = os.environ.get("CC_CHECKPOINT_DIR", os.path.join(CC_OUTPUT_ROOT, "checkpoints"))
-GPU_IDS = []
-if os.environ.get("CUDA_VISIBLE_DEVICES"):
-    GPU_IDS = [int(x) for x in os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(",") if x.strip()]
-if not GPU_IDS:
-    GPU_IDS = [0] if torch.cuda.is_available() else []
-
-
-def apply_preset(name: str):
-    global DECODE_WITH_LANG, CONTRASTIVE_WEIGHT
-    if name not in PRESETS:
-        raise KeyError(f"Unknown preset '{name}'. Available: {sorted(PRESETS)}")
-    preset = PRESETS[name]
-    for key, value in preset.items():
-        if key == "decode_with_lang":
-            DECODE_WITH_LANG = bool(value)
-        elif key == "contrastive_weight":
-            CONTRASTIVE_WEIGHT = float(value)
-        elif key == "exp_name":
-            continue
-        else:
-            globals()[key.upper()] = value
-    return preset
-
-
-def describe_runtime():
-    return {
-        "seed": SEED,
-        "epochs": EPOCHS,
-        "img_size": IMG_SIZE,
-        "batch_size": BATCH_SIZE,
-        "grad_accum_steps": GRADIENT_ACCUMULATION_STEPS,
-        "lr": LR,
-        "weight_decay": WEIGHT_DECAY,
-        "swin_type": SWIN_TYPE,
-        "window_size": WINDOW_SIZE,
-        "window12": WINDOW_SIZE == 12 or "window12" in PRETRAINED_SWIN.lower(),
-        "pretrained_swin": PRETRAINED_SWIN,
-        "spacing_unit": SPACING_UNIT or None,
-        "bert_path": BERT_PATH,
-        "bert_trainable_layers": BERT_TRAINABLE_LAYERS,
-        "decode_with_lang": DECODE_WITH_LANG,
-        "contrastive_weight": CONTRASTIVE_WEIGHT,
-        "contrastive_tau": CONTRASTIVE_TAU,
-        "contrastive_pool_region": CONTRASTIVE_POOL_REGION,
-        "python_rng_seeded": True,
-        "numpy_rng_seeded": True,
-        "torch_rng_seeded": True,
-        "cudnn_deterministic": True,
-        "cudnn_benchmark": False,
-        "checkpoint_dir": CHECKPOINT_DIR,
-        "camus_data_dir": CAMUS_DATA_DIR,
-        "device": DEVICE,
-        "git_hash": git_hash(),
-    }
-
-
-def git_hash():
-    try:
-        return subprocess.check_output(["git", "rev-parse", "--short", "HEAD"], text=True).strip()
-    except Exception:
-        return "unknown"
-
-
-def initialize_environment():
-    os.makedirs(CC_OUTPUT_ROOT, exist_ok=True)
-    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
-    return {
-        "CAMUS_DATA_DIR": CAMUS_DATA_DIR,
-        "ECHONET_DATA_DIR": ECHONET_DATA_DIR,
-        "PRETRAINED_SWIN": PRETRAINED_SWIN,
-        "BERT_PATH": BERT_PATH,
-        "CC_OUTPUT_ROOT": CC_OUTPUT_ROOT,
-        "CHECKPOINT_DIR": CHECKPOINT_DIR,
-        "device": DEVICE,
-        "git_hash": git_hash(),
-    }
-
-
-if __name__ == "__main__":
-    print(initialize_environment())

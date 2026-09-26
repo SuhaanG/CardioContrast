@@ -1,45 +1,49 @@
-"""Deterministic minibatches containing complete per-image structure triplets."""
+"""
+data/samplers.py — Batch sampler that groups all structure prompts of an image.
 
-from collections import defaultdict
-from typing import Iterator, List
+Each batch = `images_per_batch` images x 3 structure prompts, so the contrastive
+term always has same-image / different-structure negatives.
+
+IMPORTANT: this sampler is used for EVERY experiment, including the baseline.
+The previous code trained the baseline with random batches and the other runs
+with grouped batches, which changes BatchNorm statistics and batch composition
+and confounds the ablation.
+
+Implemented as a proper batch_sampler (yields lists of indices), which removes
+the old "fill pool" logic and the reliance on batch_size aligning with groups.
+"""
 
 import numpy as np
 from torch.utils.data import Sampler
 
 
-class GroupedStructureBatchSampler(Sampler[List[int]]):
-    def __init__(self, dataset, images_per_batch=2, shuffle=True, seed=42):
-        if images_per_batch < 1:
-            raise ValueError("images_per_batch must be positive")
-        self.dataset = dataset
-        self.images_per_batch = int(images_per_batch)
-        self.shuffle = bool(shuffle)
-        self.seed = int(seed)
+class GroupedStructureBatchSampler(Sampler):
+    def __init__(self, dataset, images_per_batch=1, shuffle=True, seed=42,
+                 structures_per_image=3):
+        self.groups = dataset.image_groups()
+        self.image_keys = sorted(self.groups.keys())
+        for k in self.image_keys:
+            assert len(self.groups[k]) == structures_per_image, (
+                "image {} has {} samples, expected {}".format(
+                    k, len(self.groups[k]), structures_per_image))
+        self.images_per_batch = images_per_batch
+        self.shuffle = shuffle
+        self.seed = seed
         self.epoch = 0
-        if hasattr(dataset, "image_groups"):
-            self.groups = dataset.image_groups()
-        else:
-            grouped = defaultdict(list)
-            for index, sample in enumerate(dataset.samples):
-                grouped[int(sample["image_idx"])].append(index)
-            self.groups = dict(grouped)
-        if any(len(indices) != 3 for indices in self.groups.values()):
-            raise ValueError("Every image must have exactly three structure prompts")
-        self.image_ids = sorted(self.groups)
 
     def set_epoch(self, epoch):
-        self.epoch = int(epoch)
+        self.epoch = epoch
 
-    def __iter__(self) -> Iterator[List[int]]:
-        image_ids = np.asarray(self.image_ids, dtype=np.int64)
+    def __iter__(self):
+        keys = list(self.image_keys)
         if self.shuffle:
-            rng = np.random.default_rng([self.seed, self.epoch])
-            image_ids = rng.permutation(image_ids)
-        usable = len(image_ids) // self.images_per_batch * self.images_per_batch
-        for offset in range(0, usable, self.images_per_batch):
-            batch_images = image_ids[offset:offset + self.images_per_batch]
-            batch = [index for image_id in batch_images for index in self.groups[int(image_id)]]
+            np.random.default_rng([self.seed, self.epoch]).shuffle(keys)
+        n_full = len(keys) // self.images_per_batch
+        for b in range(n_full):
+            batch = []
+            for k in keys[b * self.images_per_batch:(b + 1) * self.images_per_batch]:
+                batch.extend(self.groups[k])
             yield batch
 
     def __len__(self):
-        return len(self.image_ids) // self.images_per_batch
+        return len(self.image_keys) // self.images_per_batch

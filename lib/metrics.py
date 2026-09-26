@@ -1,222 +1,168 @@
-import math
+"""
+lib/metrics.py — Segmentation and clinical metrics used by CAMUS/TMI papers.
+
+All geometric metrics are computed at NATIVE image resolution with the pixel
+spacing from the NIfTI header, so distances are in millimetres.
+
+  dice, iou                       overlap
+  hd95, hd                        95th-percentile / max symmetric Hausdorff (mm)
+  mad                             mean absolute (symmetric surface) distance (mm)
+  leakage                         fraction of predicted pixels that fall inside a
+                                  DIFFERENT structure's ground truth -> direct
+                                  measure of cross-structure confusion, i.e. the
+                                  "disambiguation" the paper claims to improve
+  simpson_biplane_volume / ef     LV volumes (mL) and ejection fraction (%) by the
+                                  biplane method of discs from 2CH + 4CH masks
+
+Empty-mask conventions (report counts of these in the paper):
+  GT empty & pred empty -> dice = iou = 1, distances = NaN
+  exactly one empty     -> dice = iou = 0, distances = NaN (counted as failures)
+"""
 
 import numpy as np
 from scipy import ndimage
 
 
-def _surface_from_mask(mask, kernel_size=3):
-    mask = np.asarray(mask) > 0
-    if mask.size == 0:
-        return np.zeros_like(mask, dtype=np.bool_)
-    if mask.ndim != 2:
-        mask = mask.squeeze()
-    eroded = ndimage.binary_erosion(mask, structure=np.ones((kernel_size, kernel_size), dtype=bool), iterations=1)
+def _surface(mask):
+    if not mask.any():
+        return mask
+    eroded = ndimage.binary_erosion(mask, structure=np.ones((3, 3), bool), border_value=0)
     return mask & ~eroded
 
 
+def surface_distances(pred, gt, spacing):
+    """Distances (mm) from each surface pixel of pred to gt surface and vice versa."""
+    ps, gs = _surface(pred), _surface(gt)
+    dt_g = ndimage.distance_transform_edt(~gs, sampling=spacing)
+    dt_p = ndimage.distance_transform_edt(~ps, sampling=spacing)
+    return dt_g[ps], dt_p[gs]
+
+
 def binary_metrics(pred, gt, spacing):
-    pred = np.asarray(pred, dtype=np.uint8)
-    gt = np.asarray(gt, dtype=np.uint8)
-    if pred.size == 0 and gt.size == 0:
-        return {"dice": 1.0, "iou": 1.0, "hd95": np.nan, "hd": np.nan, "mad": np.nan, "empty_case": True}
-    if pred.sum() == 0 and gt.sum() == 0:
-        return {"dice": 1.0, "iou": 1.0, "hd95": np.nan, "hd": np.nan, "mad": np.nan, "empty_case": True}
-    if pred.sum() == 0 or gt.sum() == 0:
-        return {"dice": 0.0, "iou": 0.0, "hd95": np.nan, "hd": np.nan, "mad": np.nan, "empty_case": True}
-
-    inter = np.logical_and(pred > 0, gt > 0).sum()
-    union = np.logical_or(pred > 0, gt > 0).sum()
-    dice = 2.0 * inter / (pred.sum() + gt.sum()) if (pred.sum() + gt.sum()) > 0 else 0.0
-    iou = inter / union if union > 0 else 0.0
-
-    pred_surface = _surface_from_mask(pred)
-    gt_surface = _surface_from_mask(gt)
-    if pred_surface.any() and gt_surface.any():
-        dist_pred = ndimage.distance_transform_edt(~pred_surface, sampling=spacing)
-        dist_gt = ndimage.distance_transform_edt(~gt_surface, sampling=spacing)
-        dists = np.concatenate((dist_pred[gt_surface], dist_gt[pred_surface])).astype(float, copy=False)
-        hd = float(np.max(dists)) if dists.size else np.nan
-        hd95 = float(np.percentile(dists, 95)) if dists.size else np.nan
-        mad = float(np.mean(dists)) if dists.size else np.nan
-    else:
-        hd95 = hd = mad = np.nan
-    return {"dice": float(dice), "iou": float(iou), "hd95": float(hd95), "hd": float(hd), "mad": float(mad), "empty_case": False}
+    pred = pred.astype(bool)
+    gt = gt.astype(bool)
+    inter = np.logical_and(pred, gt).sum()
+    psum, gsum = pred.sum(), gt.sum()
+    union = psum + gsum - inter
+    out = {}
+    if psum == 0 and gsum == 0:
+        out.update(dice=1.0, iou=1.0, hd95=np.nan, hd=np.nan, mad=np.nan, empty_case="both")
+        return out
+    out["dice"] = 2.0 * inter / (psum + gsum)
+    out["iou"] = inter / union
+    if psum == 0 or gsum == 0:
+        out.update(hd95=np.nan, hd=np.nan, mad=np.nan,
+                   empty_case="pred" if psum == 0 else "gt")
+        return out
+    d_pg, d_gp = surface_distances(pred, gt, spacing)
+    both = np.concatenate([d_pg, d_gp])
+    out["hd95"] = float(max(np.percentile(d_pg, 95), np.percentile(d_gp, 95)))
+    out["hd"] = float(max(d_pg.max(), d_gp.max()))
+    out["mad"] = float(both.mean())
+    out["empty_case"] = "none"
+    return out
 
 
 def leakage(pred, multilabel_gt, structure):
-    pred = np.asarray(pred, dtype=np.uint8)
-    gt = np.asarray(multilabel_gt, dtype=np.uint8)
-    other = (gt > 0) & (gt != structure)
-    if pred.sum() == 0:
-        return 0.0
-    false_inside = np.logical_and(pred > 0, other)
-    return float(false_inside.sum() / max(1, (pred > 0).sum()))
+    """Fraction of predicted pixels lying in the GT of any OTHER structure."""
+    pred = pred.astype(bool)
+    n = pred.sum()
+    if n == 0:
+        return np.nan
+    other = (multilabel_gt > 0) & (multilabel_gt != structure)
+    return float(np.logical_and(pred, other).sum() / n)
 
 
-def _long_axis_diameters(lv_mask, la_mask, spacing, n_discs):
-    lv = np.asarray(lv_mask).squeeze() > 0
-    if lv.ndim != 2 or not lv.any():
-        return None, 0.0, max(spacing)
-    sx, sy = map(float, spacing)
-    if sx <= 0 or sy <= 0:
-        raise ValueError("Pixel spacing must be positive")
-
-    coordinates = np.argwhere(lv).astype(float)
-    physical = coordinates * np.asarray((sy, sx))
-    surface = _surface_from_mask(lv)
-    la = None if la_mask is None else np.asarray(la_mask).squeeze() > 0
-    if la is not None and la.shape != lv.shape:
-        raise ValueError("LV and LA masks for a view must have identical shapes")
-
-    contact = np.empty((0, 2), dtype=float)
-    if la is not None and la.any():
-        adjacent_la = ndimage.binary_dilation(la, structure=np.ones((3, 3), dtype=bool))
-        contact_pixels = np.argwhere(surface & adjacent_la)
-        if contact_pixels.size:
-            contact = contact_pixels.astype(float) * np.asarray((sy, sx))
-
-    if contact.size:
-        base = contact.mean(axis=0)
-    else:
-        centered = physical - physical.mean(axis=0)
-        _, _, axes = np.linalg.svd(centered, full_matrices=False)
-        principal_axis = axes[0]
-        projections = centered @ principal_axis
-        endpoints = np.stack((physical[np.argmin(projections)], physical[np.argmax(projections)]))
-        if la is not None and la.any():
-            la_center = np.argwhere(la).mean(axis=0) * np.asarray((sy, sx))
-            base = endpoints[np.argmin(np.linalg.norm(endpoints - la_center, axis=1))]
-        else:
-            base = endpoints[0]
-
-    apex = physical[np.argmax(np.linalg.norm(physical - base, axis=1))]
-    axis = apex - base
-    length = float(np.linalg.norm(axis))
-    if length <= 0:
-        return None, 0.0, max(spacing)
-    axis /= length
-    perpendicular = np.asarray((-axis[1], axis[0]))
-    along = (physical - base) @ axis
-    across = (physical - base) @ perpendicular
-    pixel_step_along = float(np.hypot(axis[0] * sy, axis[1] * sx))
-    pixel_step_across = float(np.hypot(perpendicular[0] * sy, perpendicular[1] * sx))
-    half_band = 0.75 * pixel_step_along
-
-    diameters = []
-    for disc in range(n_discs):
-        center = (disc + 0.5) * length / n_discs
-        selected = np.abs(along - center) <= half_band
-        if not selected.any():
-            selected[np.argmin(np.abs(along - center))] = True
-        diameter = float(across[selected].max() - across[selected].min() + pixel_step_across)
-        diameters.append(diameter)
-    return np.asarray(diameters), length, max(sx, sy)
+# --------------------------------------------------------------------------- EF
+def _pts_mm(mask, spacing):
+    return np.argwhere(mask).astype(np.float64) * np.asarray(spacing, dtype=np.float64)
 
 
-def simpson_volume(lv_2ch, lv_4ch, la_2ch=None, la_4ch=None,
-                   spacing_2ch=(1.0, 1.0), spacing_4ch=(1.0, 1.0), n_discs=20):
-    """Estimate biplane LV volume in mL from ED or ES 2CH/4CH masks.
-
-    Spacing tuples are ordered as (x, y) in millimeters. LA masks are optional;
-    without them the long-axis base is chosen from the principal-axis extremes.
+def lv_long_axis(lv, spacing, la=None):
     """
-    if n_discs < 1:
-        raise ValueError("n_discs must be positive")
-    if not np.asarray(lv_2ch).size or not np.asarray(lv_4ch).size:
-        return 0.0
-    diameters_2ch, length_2ch, pixel_2ch = _long_axis_diameters(
-        lv_2ch, la_2ch, spacing_2ch, n_discs
-    )
-    diameters_4ch, length_4ch, pixel_4ch = _long_axis_diameters(
-        lv_4ch, la_4ch, spacing_4ch, n_discs
-    )
-    if diameters_2ch is None or diameters_4ch is None:
-        return 0.0
-    length = max(length_2ch, length_4ch) + max(pixel_2ch, pixel_4ch)
-    volume_mm3 = (math.pi / 4.0) * np.sum(diameters_2ch * diameters_4ch) * length / n_discs
-    return float(volume_mm3 / 1000.0)
+    Return (base_midpoint, apex) in mm.
+    Base = midpoint of the LV/LA contact (mitral annulus proxy) when an LA mask is
+    given and touches the LV; apex = LV pixel farthest from that midpoint.
+    Fallback: the two extremes of the LV along its principal axis.
+    """
+    pts = _pts_mm(lv, spacing)
+    if la is not None and la.any():
+        contact = lv & ndimage.binary_dilation(la, iterations=2)
+        if contact.sum() >= 2:
+            c = _pts_mm(contact, spacing)
+            cc = c - c.mean(0)
+            u = np.linalg.svd(cc, full_matrices=False)[2][0]
+            proj = cc @ u
+            base = (c[proj.argmin()] + c[proj.argmax()]) / 2.0
+            apex = pts[np.linalg.norm(pts - base, axis=1).argmax()]
+            return base, apex
+    cen = pts.mean(0)
+    u = np.linalg.svd(pts - cen, full_matrices=False)[2][0]
+    proj = (pts - cen) @ u
+    return pts[proj.argmin()], pts[proj.argmax()]
+
+
+def disc_diameters(lv, spacing, la=None, n_discs=20):
+    """Diameters (mm) of n_discs slabs perpendicular to the long axis, and length L."""
+    if lv.sum() < 10:
+        return np.zeros(n_discs), 0.0
+    base, apex = lv_long_axis(lv, spacing, la)
+    axis = apex - base
+    L = float(np.linalg.norm(axis))
+    if L == 0:
+        return np.zeros(n_discs), 0.0
+    u = axis / L
+    perp = np.array([-u[1], u[0]])
+    pts = _pts_mm(lv, spacing)
+    t = (pts - base) @ u
+    s = (pts - base) @ perp
+    px = float(np.mean(spacing))
+    diam = np.zeros(n_discs)
+    edges = np.linspace(0, L, n_discs + 1)
+    for i in range(n_discs):
+        # Diameter measured at the disc MID-plane (thin band), as in the method
+        # of discs; the max over the whole slab would over-estimate volume.
+        mid = 0.5 * (edges[i] + edges[i + 1])
+        sel = np.abs(t - mid) <= 0.75 * px
+        if not sel.any():
+            sel = (t >= edges[i]) & (t < edges[i + 1])
+        if sel.any():
+            diam[i] = s[sel].max() - s[sel].min() + px
+    return diam, L + px   # + px: base/apex are pixel centres
+
+
+def simpson_biplane_volume(lv_2ch, sp_2ch, lv_4ch, sp_4ch, la_2ch=None, la_4ch=None,
+                           n_discs=20):
+    """LV volume in mL by the biplane method of discs."""
+    a, L2 = disc_diameters(lv_2ch.astype(bool), sp_2ch,
+                           None if la_2ch is None else la_2ch.astype(bool), n_discs)
+    b, L4 = disc_diameters(lv_4ch.astype(bool), sp_4ch,
+                           None if la_4ch is None else la_4ch.astype(bool), n_discs)
+    L = max(L2, L4)
+    vol_mm3 = np.pi / 4.0 * np.sum(a * b) * (L / n_discs)
+    return vol_mm3 / 1000.0
 
 
 def ejection_fraction(edv, esv):
-    return 100.0 * (edv - esv) / edv if edv > 0 else 0.0
+    if edv <= 0:
+        return np.nan
+    return 100.0 * (edv - esv) / edv
 
 
 def agreement(x, y):
-    x = np.asarray(x, dtype=float)
-    y = np.asarray(y, dtype=float)
-    valid = np.isfinite(x) & np.isfinite(y)
-    x = x[valid]
-    y = y[valid]
-    n = int(len(x))
-    if n < 2:
-        return {"n": n, "r": np.nan, "bias": np.nan, "mae": np.nan, "loa": (np.nan, np.nan)}
-    r = np.corrcoef(x, y)[0, 1]
-    bias = float(np.mean(x - y))
-    mae = float(np.mean(np.abs(x - y)))
-    diff = x - y
-    loa = (float(np.mean(diff) - 1.96 * np.std(diff, ddof=1)), float(np.mean(diff) + 1.96 * np.std(diff, ddof=1)))
-    return {"n": n, "r": float(r), "bias": bias, "mae": mae, "loa": loa}
-
-
-def per_structure_metrics(pred, gt, structure_id=1, spacing=(1.0, 1.0)):
-    pred = np.asarray(pred, dtype=np.uint8)
-    gt = np.asarray(gt, dtype=np.uint8)
-    pred_area = (pred > 0).sum()
-    gt_area = (gt > 0).sum()
-    empty_case = bool((pred_area == 0) or (gt_area == 0))
-
-    if empty_case:
-        return {
-            "structure_id": int(structure_id),
-            "dice": 1.0 if pred_area == 0 and gt_area == 0 else 0.0,
-            "iou": 1.0 if pred_area == 0 and gt_area == 0 else 0.0,
-            "hd95": np.nan,
-            "hd": np.nan,
-            "mad": np.nan,
-            "empty_case": empty_case,
-        }
-
-    base = binary_metrics(pred, gt, spacing=spacing)
+    """Pearson r, bias (mean y-x), MAE, 95% limits of agreement."""
+    x = np.asarray(x, float)
+    y = np.asarray(y, float)
+    ok = np.isfinite(x) & np.isfinite(y)
+    x, y = x[ok], y[ok]
+    if len(x) < 3:
+        return {"n": int(len(x))}
+    d = y - x
     return {
-        "structure_id": int(structure_id),
-        "dice": float(base["dice"]),
-        "iou": float(base["iou"]),
-        "hd95": float(base["hd95"]),
-        "hd": float(base["hd"]),
-        "mad": float(base["mad"]),
-        "empty_case": False,
+        "n": int(len(x)),
+        "pearson_r": float(np.corrcoef(x, y)[0, 1]),
+        "bias": float(d.mean()),
+        "mae": float(np.abs(d).mean()),
+        "loa_low": float(d.mean() - 1.96 * d.std(ddof=1)),
+        "loa_high": float(d.mean() + 1.96 * d.std(ddof=1)),
     }
-
-
-def bootstrap_confidence_interval(values, confidence=0.95, n_bootstrap=2000, seed=42):
-    values = np.asarray(values, dtype=float)
-    if values.size == 0:
-        return {"lower": np.nan, "estimate": np.nan, "upper": np.nan, "n": 0}
-
-    rng = np.random.default_rng(seed)
-    boot = []
-    for _ in range(int(n_bootstrap)):
-        sample = rng.choice(values, size=values.size, replace=True)
-        boot.append(float(np.mean(sample)))
-    boot = np.asarray(boot, dtype=float)
-    alpha = 1.0 - confidence
-    lower = np.quantile(boot, alpha / 2.0)
-    upper = np.quantile(boot, 1.0 - alpha / 2.0)
-    return {
-        "lower": float(lower),
-        "estimate": float(np.mean(values)),
-        "upper": float(upper),
-        "n": int(values.size),
-        "confidence": float(confidence),
-    }
-
-
-__all__ = [
-    "binary_metrics",
-    "leakage",
-    "simpson_volume",
-    "ejection_fraction",
-    "agreement",
-    "per_structure_metrics",
-    "bootstrap_confidence_interval",
-]

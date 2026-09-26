@@ -1,75 +1,85 @@
+"""
+lib/_utils.py — CardioContrast model wrapper (LAVT-One style: text encoder inside).
+
+Text encoder options (the language ablation reviewers will ask for):
+  'bert'      : BERT-base. Embeddings + the last (12 - bert_trainable_layers)
+                blocks are frozen with requires_grad=False (the old code left
+                them requiring grad but simply omitted them from the optimizer,
+                which wasted memory/compute and made the paper text and figure
+                disagree about what is frozen).
+  'embedding' : a learned (num_classes x num_tokens x 768) table indexed by the
+                structure id. Same tensor layout as BERT output, so the rest of
+                the network is unchanged. If CardioContrast with BERT does not
+                beat this, the "language-guided" claim does not hold.
+
+decode_with_lang is a constructor attribute (not a forward kwarg), so it is
+saved with the checkpoint and cannot silently differ between train and eval.
+"""
+
 import torch
 from torch import nn
 from torch.nn import functional as F
 
 
 class ClassEmbeddingEncoder(nn.Module):
-    def __init__(self, num_classes=3, embed_tokens=8, embed_dim=768):
+    def __init__(self, num_classes=3, num_tokens=8, dim=768):
         super().__init__()
-        self.num_classes = num_classes
-        self.embed_tokens = embed_tokens
-        self.table = nn.Parameter(torch.zeros(num_classes, embed_tokens, embed_dim))
-        nn.init.normal_(self.table, mean=0.0, std=0.02)
-        self.register_buffer("mask", torch.ones(num_classes, embed_tokens, 1, dtype=torch.float32))
+        self.table = nn.Parameter(torch.randn(num_classes, num_tokens, dim) * 0.02)
+        self.num_tokens = num_tokens
 
     def forward(self, class_ids):
-        class_ids = class_ids.clamp(0, self.num_classes - 1)
-        return self.table[class_ids]
+        feats = self.table[class_ids]                              # (B, T, D)
+        mask = torch.ones(feats.shape[:2], dtype=torch.long, device=feats.device)
+        return feats, mask
 
 
 class CardioContrastNet(nn.Module):
-    def __init__(self, backbone, classifier, text_encoder="bert", bert_path=None,
-                 bert_trainable_layers=10, decode_with_lang=True, embed_tokens=8):
+    def __init__(self, backbone, classifier, text_encoder="bert", bert_path="bert-base-uncased",
+                 bert_trainable_layers=10, decode_with_lang=True, num_classes=3,
+                 embed_tokens=8):
         super().__init__()
         self.backbone = backbone
         self.classifier = classifier
         self.text_encoder_type = text_encoder
-        self.decode_with_lang = bool(decode_with_lang)
-        self.bert_path = bert_path
-        self.bert_trainable_layers = int(bert_trainable_layers)
-        self.embed_tokens = int(embed_tokens)
+        self.decode_with_lang = decode_with_lang
 
         if text_encoder == "bert":
             from transformers import BertModel
-
-            self.text_encoder = BertModel.from_pretrained(
-                bert_path or "bert-base-uncased", add_pooling_layer=False
-            )
-            for parameter in self.text_encoder.embeddings.parameters():
-                parameter.requires_grad = False
-            for layer in self.text_encoder.encoder.layer[self.bert_trainable_layers:]:
-                layer.requires_grad_(False)
+            self.text_encoder = BertModel.from_pretrained(bert_path, add_pooling_layer=False)
+            n_layers = len(self.text_encoder.encoder.layer)
+            for p in self.text_encoder.embeddings.parameters():
+                p.requires_grad = False
+            for i, layer in enumerate(self.text_encoder.encoder.layer):
+                trainable = i < bert_trainable_layers
+                for p in layer.parameters():
+                    p.requires_grad = trainable
+            print("[model] BERT: embeddings frozen, blocks 1-{} trainable, {}-{} frozen".format(
+                bert_trainable_layers, bert_trainable_layers + 1, n_layers), flush=True)
         elif text_encoder == "embedding":
-            self.text_encoder = ClassEmbeddingEncoder(3, self.embed_tokens, 768)
+            self.text_encoder = ClassEmbeddingEncoder(num_classes, embed_tokens, 768)
+            print("[model] Text encoder: learned class embedding ({} tokens)".format(
+                embed_tokens), flush=True)
         else:
-            raise ValueError(f"Unknown text_encoder={text_encoder!r}")
+            raise ValueError(text_encoder)
 
     def encode_text(self, input_ids, attn_mask, class_ids):
-        if self.text_encoder_type == "embedding":
-            token_embeddings = self.text_encoder(class_ids)
-            lang_feat = token_embeddings.permute(0, 2, 1)
-            lang_mask = torch.ones(
-                (token_embeddings.shape[0], token_embeddings.shape[1], 1),
-                device=token_embeddings.device,
-                dtype=torch.long,
-            )
-            return lang_feat, lang_mask
-        output = self.text_encoder(input_ids=input_ids, attention_mask=attn_mask)
-        return output.last_hidden_state.permute(0, 2, 1), attn_mask.unsqueeze(-1)
+        if self.text_encoder_type == "bert":
+            feats = self.text_encoder(input_ids, attention_mask=attn_mask)[0]    # (B, T, 768)
+            mask = attn_mask
+        else:
+            feats, mask = self.text_encoder(class_ids)
+        return feats.permute(0, 2, 1), mask.unsqueeze(-1)                        # (B,768,T),(B,T,1)
 
-    def forward(self, x, input_ids, attn_mask, class_ids, return_features=False):
-        lang_feat, lang_mask = self.encode_text(input_ids, attn_mask, class_ids)
-        features = self.backbone(x, lang_feat, lang_mask)
-        x_c1, x_c2, x_c3, x_c4 = features
-        decoder_lang = lang_feat if self.decode_with_lang else None
-        decoder_mask = lang_mask if self.decode_with_lang else None
-        logits, pre_logit_features = self.classifier(
-            x_c4, x_c3, x_c2, x_c1,
-            lang_feat=decoder_lang,
-            lang_mask=decoder_mask,
-            return_features=True,
-        )
-        logits = F.interpolate(logits, size=x.shape[-2:], mode="bilinear", align_corners=True)
+    def forward(self, x, input_ids=None, attn_mask=None, class_ids=None, return_features=False):
+        input_shape = x.shape[-2:]
+        l_feats, l_mask = self.encode_text(input_ids, attn_mask, class_ids)
+        x_c1, x_c2, x_c3, x_c4 = self.backbone(x, l_feats, l_mask)
+
+        lang = l_feats if self.decode_with_lang else None
+        lmask = l_mask if self.decode_with_lang else None
+        logits, feats = self.classifier(x_c4, x_c3, x_c2, x_c1, lang_feat=lang,
+                                        lang_mask=lmask, return_features=True)
+        logits = F.interpolate(logits, size=input_shape, mode="bilinear", align_corners=True)
         if return_features:
-            return logits, pre_logit_features
+            return logits, feats
         return logits

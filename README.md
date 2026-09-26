@@ -1,131 +1,102 @@
 # CardioContrast
 
-CardioContrast is a language-guided CAMUS echocardiographic segmentation research pipeline. The active model combines a multimodal Swin backbone, a three-stage gated decoder cross-attention module, and a same-image/different-structure contrastive objective.
+Language-guided echocardiographic segmentation (CAMUS: LV endocardium, myocardium, left atrium), built on LAVT, with two additions:
+
+1. **Multi-stage decoder cross-attention**: language is re-injected at every decoder stage through a gated residual.
+2. **Contrastive anatomical repulsion loss**: decoder features for different structure prompts on the same image are pushed apart.
+
+Out-of-distribution test: EchoNet-Dynamic (never used for training; LV labels only).
+
+---
+
+## What changed in this revision (and why)
+
+| Area | Old behaviour | Now | Why it matters |
+|---|---|---|---|
+| Split | Patients 451–500 were used as "val" **and** for checkpoint selection | Patient-level train / val / test (`data/splits.py`); uses the official `database_split/*.txt` if present, otherwise 1–400 / 401–450 / 451–500 | The old numbers were picked on the test set, so they were optimistically biased |
+| Metric | Overall IoU at 352×352 | Dice, IoU, HD95, HD, MAD **in mm at native resolution**, per structure × ED/ES × image quality, plus cross-structure **leakage** | Matches CAMUS/TMI reporting; overall IoU hides the myocardium |
+| Clinical | none | EDV / ESV / EF (biplane Simpson) with r, bias, MAE, limits of agreement | The paper's motivation is LVEF |
+| Ablation | Baseline used random batches; the other runs used grouped batches | Same sampler, loss, augmentation and schedule for every run | Otherwise Exp1 vs Exp2–4 is confounded |
+| Loss | CE with weights 0.59/3.41 computed from the union of all structures | CE + soft Dice | The weights did not match the per-prompt binary task (~5% foreground, not ~15%) |
+| Contrastive | Sum of softplus(sim/τ), τ = 0.07 (≈27 per anchor at init); pooling weights not detached; BatchNorm on 3 samples | τ·softplus(sim/τ) averaged over negatives; detached weights; LayerNorm; pooling region `pred` / `gt` / `union` | The loss was ~2× the segmentation loss at init; the mask could be reshaped to satisfy the loss; BN on 3 vectors is noise |
+| Decoder CA | Double Q/K/V projection; features replaced by `out_proj(LN(S+Z))` | One MHA with kdim/vdim; `S + tanh(g)·W_out(MHA(LN(S),L,L))`, g=0 at init (higher LR for g) | Starts exactly as the baseline decoder; gate values show how much language each stage uses |
+| Language ablation | none | `--text_encoder embedding` (learned class lookup) and paraphrase training / held-out paraphrase testing | Tests whether *language*, rather than a class index, does the work |
+| Baselines | none | nnU-Net export/eval with the same split; SAM / MedSAM box and point prompts | The first two things a reviewer will ask for |
+| Stats | single run | `compare_runs.py`: per-patient paired Wilcoxon + bootstrap CI + Holm; `tools/make_table.py`: mean ± std over seeds | |
+| Engineering | Hand-edit `config.py` per run; DataParallel with batch 3; `gc.collect()` every step; dead RefCOCO code | CLI presets, bf16 autocast, resume, optimizer coverage check, CPU unit tests | |
+
+**Existing checkpoints are incompatible with this revision.** Retrain everything; no old number is reportable.
+
+---
 
 ## Setup
 
-Install a PyTorch build appropriate for the target CPU/CUDA system, then install the remaining dependencies:
-
 ```bash
-python -m pip install -r requirements.txt
+git clone https://github.com/SuhaanG/CardioContrast.git && cd CardioContrast
+pip install -r requirements.txt          # install torch/torchvision for your CUDA first
+mkdir -p pretrained_weights
+wget -P pretrained_weights https://github.com/SwinTransformer/storage/releases/download/v1.0.0/swin_base_patch4_window12_384_22k.pth
+export CAMUS_DATA_DIR=/content/CAMUS_public/CAMUS_public/database_nifti   # or edit config.py
+python tests/test_core.py                 # must print ALL TESTS PASSED
 ```
 
-Configure paths with environment variables; no machine-specific paths are embedded in the training workflow:
+Check the split printout at the start of training. It says whether the official `database_split` files were found.
+
+## Smoke test (≈2 minutes, run before any full job)
 
 ```bash
-CAMUS_DATA_DIR=/path/to/database_nifti
-PRETRAINED_SWIN=/path/to/swin_checkpoint.pth
-BERT_PATH=bert-base-uncased
-CC_OUTPUT_ROOT=/path/to/outputs
+python train_cardiocontrast.py --preset exp4_cardiocontrast --epochs 1 --max_images 12 --exp_name smoke
 ```
 
-On Windows PowerShell, use `$env:CAMUS_DATA_DIR = "..."` syntax. If a CAMUS NIfTI header omits spatial units, verify the source units before setting `CC_SPACING_UNIT` to `mm`, `meter`, or `micron`; physical distance metrics intentionally reject unknown units.
+## Experiments
 
-## Data protocol
+Every run: `python train_cardiocontrast.py --preset <name> --seed <s>` → `experiments/<name>_seed<s>/`, then `python evaluate.py --run_dir experiments/<name>_seed<s>`.
 
-The dataset uses official `database_split/subgroup_{training,validation,testing}.txt` files when available. Otherwise the fallback is patients 001–400 for train, 401–450 for validation, and 451–500 for test. Training and checkpoint selection use train and validation only; test is reserved for evaluation and baseline scoring.
+| Preset | Decoder CA | Contrastive | Text | Purpose |
+|---|---|---|---|---|
+| `exp1_baseline` | off | off | BERT | LAVT baseline |
+| `exp2_decoder_ca` | on | off | BERT | Contribution 1 alone |
+| `exp3_contrastive` | off | on | BERT | Contribution 2 alone |
+| `exp4_cardiocontrast` | on | on | BERT | Full method |
+| `exp5_class_embedding` | on | on | learned class table | **Does language matter?** |
+| `exp6_paraphrase` | on | on | BERT, paraphrase prompts | Language generalisation (evaluate with `--prompt_set heldout`) |
+| `exp7_union_pool` | on | on (union pooling) | BERT | Stricter version of the contrastive loss (same pixels for all prompts) |
 
-Each image is represented by three contiguous structure prompts. All experiments use the same deterministic grouped batch sampler, which keeps each image's three structures together. Training augmentation is synchronized across prompts and seeded by `(seed, epoch, image_idx)`. Canonical, paraphrase-training, and held-out prompt banks are kept separate.
+Order:
 
-## Presets
-
-| Preset | Decoder cross-attention | Contrastive weight | Text/prompt/pooling change |
-| --- | --- | ---: | --- |
-| `exp1_baseline` | Off | 0.0 | Standard BERT-conditioned backbone |
-| `exp2_decoder_ca` | On | 0.0 | Decoder cross-attention |
-| `exp3_contrastive` | Off | 0.1 | Contrastive objective |
-| `exp4_cardiocontrast` | On | 0.1 | Full method |
-| `exp5_class_embedding` | On | 0.1 | Learned class-token encoder |
-| `exp6_paraphrase` | On | 0.1 | Training paraphrase bank |
-| `exp7_union_pool` | On | 0.1 | Union-mask contrastive pooling |
-
-Explicit CLI flags override preset values.
-
-## Smoke and training
-
-Run the CPU regression suite:
+1. **λ on validation first:** run `exp4_cardiocontrast` with `--contrastive_weight 0.1`, `0.3` and `1.0` (`--exp_name lam0.1` etc.) and pick the best by `val_mean_dice` in `log.csv`. Use that λ for exp3–exp7 (`--contrastive_weight X`). Never pick λ from test results.
+2. Run exp1–exp5 with seeds 42, 43, 44.
+3. Run exp6 and exp7 (one seed first; add seeds if they matter for the story).
+4. Baselines: nnU-Net (`tools/export_nnunet.py`, instructions in the file header) and SAM/MedSAM (`baselines/sam_prompt_eval.py`).
+5. EchoNet-Dynamic: `python evaluate_echonet.py --run_dir <run> --orientation_check` first, then the real run.
+6. Tables and statistics:
 
 ```bash
-python tests/test_core.py
+python tools/make_table.py --run "LAVT=experiments/exp1_baseline_seed*" \
+    --run "CardioContrast=experiments/exp4_cardiocontrast_seed*" \
+    --run "Class-embedding=experiments/exp5_class_embedding_seed*" \
+    --run "nnU-Net 2D=experiments/nnunet_2d_fold0"
+python compare_runs.py --a experiments/exp1_baseline_seed42/eval_test_canonical,experiments/exp1_baseline_seed43/eval_test_canonical,experiments/exp1_baseline_seed44/eval_test_canonical \
+                       --b experiments/exp4_cardiocontrast_seed42/eval_test_canonical,experiments/exp4_cardiocontrast_seed43/eval_test_canonical,experiments/exp4_cardiocontrast_seed44/eval_test_canonical
 ```
 
-Create a disposable CAMUS-style NIfTI fixture and run the CPU smoke path without remote BERT assets:
+## Things to check before reporting
 
-```bash
-python tests/make_synthetic_camus.py --output-dir /tmp/cardio-smoke
-python train_cardiocontrast.py --preset exp5_class_embedding --epochs 1 --max_images 12 --swin_type tiny --img_size 192 --window_size 6 --device cpu --data_dir /tmp/cardio-smoke/database_nifti --output_root /tmp/cardio-smoke/runs
-python evaluate.py --run_dir /tmp/cardio-smoke/runs/exp5_class_embedding_seed42 --split val --device cpu
+- `evaluate.py` prints a **sanity line**: our Simpson EF on GT masks vs the EF stored in the CAMUS cfg files. If r is well below ~0.9, the long-axis estimate in `lib/metrics.py` needs work before any EF number goes in the paper.
+- `log.csv` columns `gate_stage*` (how much each decoder stage uses language) and `val_prompt_feature_cos` (head-free cosine between prompt-conditioned features at the same pixels; lower = more separated) are figure material for the paper and are comparable across all runs, including the baseline.
+- The test split is used only by `evaluate.py`. Do not re-run test evaluation to choose anything.
+
+## Files
+
 ```
-
-For PowerShell, replace `/tmp/cardio-smoke` with a writable Windows path. This checks data loading, forward/backward, checkpoint writing/reloading, validation, and reporting, but uses random Swin initialization and makes no performance claim. Real experiments should use the configured pretrained weights. Training writes `<CC_OUTPUT_ROOT>/<exp_name>_seed<seed>/args.json`, `log.csv`, `best.pth`, and `last.pth`. Resume with `--resume <run_dir>/last.pth`.
-
-Inspect the seven experiment commands without launching runs:
-
-```bash
-python run_ablation_suite.py --dry-run
+train_cardiocontrast.py   training (all presets)
+evaluate.py               native-resolution test evaluation + EF
+evaluate_echonet.py       EchoNet-Dynamic OOD (LV only)
+compare_runs.py           paired statistics between runs
+config.py                 paths, defaults, presets
+data/                     dataset, split, prompts, sampler
+lib/                      Swin+PWAM backbone, decoder, text encoders, contrastive loss, metrics, report
+tools/                    nnU-Net export/eval, results table
+baselines/                SAM / MedSAM prompt baselines
+tests/test_core.py        CPU unit tests
 ```
-
-The recommended experimental order is:
-
-1. Select the contrastive weight from `{0.1, 0.3, 1.0}` using validation only.
-2. Run `exp1`–`exp5` with seeds 42, 43, and 44.
-3. Run `exp6` and `exp7` with the preselected weight and seeds.
-4. Export and train the nnU-Net baseline, then evaluate its multi-label predictions.
-5. Evaluate SAM/MedSAM prompt baselines and run EchoNet-Dynamic LV evaluation.
-6. Run paired statistics and generate paper tables.
-
-For a lambda sweep, use a separate `CC_OUTPUT_ROOT` per weight so runs cannot overwrite each other, evaluate each candidate with `evaluate.py --split val`, then compare the validation summaries with `compare_runs.py --split val` before freezing the selected weight.
-
-## Final evaluation
-
-Choose a checkpoint using validation only, then evaluate it once on test:
-
-```bash
-python evaluate.py --run_dir outputs/cardiocontrast/exp4_cardiocontrast_seed42 --ckpt best.pth --split test --prompt_set canonical
-```
-
-Outputs are written under `eval_<split>_<prompt_set>/`: `per_sample.csv`, `per_patient.csv`, `clinical.csv`, and `summary.json`. Metrics are computed at native resolution; surface distances use millimeters from NIfTI spacing. Bootstrap intervals resample patients, not correlated frames. `--save_preds` writes compressed per-sample masks and probabilities. Do not use test results for model, prompt, or hyperparameter selection.
-
-## Baselines and analysis
-
-Export the patient-disjoint CAMUS files for nnU-Net v2:
-
-```bash
-python tools/export_nnunet.py --output_root /path/to/nnUNet_raw --dataset_id 501
-nnUNetv2_plan_and_preprocess -d 501 -c 2d
-nnUNetv2_train 501 2d 0
-nnUNetv2_predict -i /path/to/nnUNet_raw/Dataset501_CardioContrast/imagesTs -o /path/to/nnunet_predictions -d 501 -c 2d -f 0
-python tools/eval_nnunet.py --pred_dir /path/to/nnunet_predictions
-```
-
-SAM requires the optional `segment-anything` package and a compatible checkpoint. MedSAM is evaluated with box prompts only; standard SAM also supports point prompts:
-
-```bash
-python baselines/sam_prompt_eval.py --weights /path/to/sam_checkpoint.pth --variant sam --prompt_type box
-python baselines/sam_prompt_eval.py --weights /path/to/medsam_checkpoint.pth --variant medsam --prompt_type box
-```
-
-EchoNet-Dynamic requires its separately downloaded videos and CSV files:
-
-```bash
-python evaluate_echonet.py --run_dir outputs/cardiocontrast/exp4_cardiocontrast_seed42 --orientation_check
-```
-
-It reports only LV prompt Dice and HD95 in pixels; overlays for all three prompts are qualitative. For patient-paired comparisons and seed-summary tables:
-
-```bash
-python compare_runs.py --a outputs/cardiocontrast/exp1_baseline_seed* --b outputs/cardiocontrast/exp4_cardiocontrast_seed* --min_patients 10
-python tools/make_table.py --run "Baseline=outputs/cardiocontrast/exp1_baseline_seed*" --run "CardioContrast=outputs/cardiocontrast/exp4_cardiocontrast_seed*"
-```
-
-The nnU-Net and SAM packages/checkpoints, CAMUS/EchoNet datasets, CUDA, and the final per-run predictions are external prerequisites; scripts cannot establish baseline performance without them.
-
-## Pre-reporting gates
-
-- Run `python tests/test_core.py` and `python -m pip install pyflakes` followed by `python -m pyflakes` over the active Python files.
-- Complete the synthetic CAMUS-style NIfTI CPU smoke run, then evaluate its validation split and run the comparison tooling.
-- Verify the GT-mask Simpson EF sanity correlation against CAMUS CFG EF is approximately `r >= 0.9` before making clinical claims.
-- Record three seeds, patient-level confidence intervals, paired Wilcoxon tests, and Holm-corrected p-values.
-- Confirm the held-out test cohort has been evaluated once only.
-
-No benchmark numbers are asserted by this repository alone. Dataset-backed, multi-seed, external-baseline, and EchoNet results must be run and archived before submission.
