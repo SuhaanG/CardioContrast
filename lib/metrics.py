@@ -118,4 +118,35 @@ def per_structure_metrics(pred, gt, structure_id=1, spacing=(1.0, 1.0)):
     }
 
 
-__all__ = ["binary_metrics", "leakage", "simpson_volume", "ejection_fraction", "agreement", "per_structure_metrics"]
+def bootstrap_confidence_interval(values, confidence=0.95, n_bootstrap=2000, seed=42):
+    values = np.asarray(values, dtype=float)
+    if values.size == 0:
+        return {"lower": np.nan, "estimate": np.nan, "upper": np.nan, "n": 0}
+
+    rng = np.random.default_rng(seed)
+    boot = []
+    for _ in range(int(n_bootstrap)):
+        sample = rng.choice(values, size=values.size, replace=True)
+        boot.append(float(np.mean(sample)))
+    boot = np.asarray(boot, dtype=float)
+    alpha = 1.0 - confidence
+    lower = np.quantile(boot, alpha / 2.0)
+    upper = np.quantile(boot, 1.0 - alpha / 2.0)
+    return {
+        "lower": float(lower),
+        "estimate": float(np.mean(values)),
+        "upper": float(upper),
+        "n": int(values.size),
+        "confidence": float(confidence),
+    }
+
+
+__all__ = [
+    "binary_metrics",
+    "leakage",
+    "simpson_volume",
+    "ejection_fraction",
+    "agreement",
+    "per_structure_metrics",
+    "bootstrap_confidence_interval",
+]
