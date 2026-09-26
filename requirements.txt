@@ -16,3 +16,4 @@ sentencepiece
 filelock
 packaging
 tokenizers
+scipy

@@ -1,0 +1,1 @@
+"""CAMUS data package."""

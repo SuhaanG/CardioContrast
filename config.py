@@ -1,98 +1,62 @@
-# config.py — all paths and hyperparameters in one place.
-# Mohammed: edit the PATHS section below to match the lab machine.
-# Nothing else needs to be edited to run training.
-
 import os
-import torch
+import subprocess
 
-# =====================================================================
-# 1. PATHS — EDIT THESE TO MATCH YOUR MACHINE
-# =====================================================================
-CAMUS_DATA_DIR   = "/content/CAMUS_public/CAMUS_public/database_nifti"
-ECHONET_DATA_DIR = "/content/EchoNet"
-PRETRAINED_SWIN  = "/content/CardioContrast/pretrained_weights/swin_base_patch4_window12_384_22k.pth"
-CHECKPOINT_DIR   = "/content/CardioContrast/experiments/checkpoints"
-OUTPUT_DIR       = "/content/CardioContrast/experiments/outputs"
-LOG_DIR          = "/content/CardioContrast/logs"
-BERT_PATH = "/content/bert-base-uncased"
+CAMUS_DATA_DIR = os.environ.get("CAMUS_DATA_DIR", os.path.join("data", "CAMUS"))
+ECHONET_DATA_DIR = os.environ.get("ECHONET_DATA_DIR", os.path.join("data", "EchoNet"))
+PRETRAINED_SWIN = os.environ.get("PRETRAINED_SWIN", "")
+BERT_PATH = os.environ.get("BERT_PATH", "bert-base-uncased")
+CC_OUTPUT_ROOT = os.environ.get("CC_OUTPUT_ROOT", os.path.join("outputs", "cardiocontrast"))
 
-# =====================================================================
-# 2. COMPUTE CONFIGURATION
-# =====================================================================
-DEVICE  = "cuda" if torch.cuda.is_available() else "cpu"
-GPU_IDS = [0, 1] if torch.cuda.device_count() > 1 else [0]
+DEVICE = "cuda" if os.environ.get("CUDA_VISIBLE_DEVICES") else "cpu"
 
-# =====================================================================
-# 3. TRAINING HYPERPARAMETERS
-# =====================================================================
-BATCH_SIZE                  = 3
-GRADIENT_ACCUMULATION_STEPS = 4
-LR           = 0.00005
-WEIGHT_DECAY = 1e-2
-EPOCHS       = 40
-IMG_SIZE     = 352
-SWIN_TYPE    = "base"
-SEED         = 42
+DEFAULTS = {
+    "seed": 42,
+    "epochs": 40,
+    "img_size": 352,
+    "batch_size": 3,
+    "grad_accum_steps": 4,
+    "learning_rate": 5e-5,
+    "weight_decay": 1e-2,
+    "swin_type": "base",
+    "window_size": 7,
+    "decode_with_lang": True,
+    "contrastive_weight": 0.1,
+    "contrastive_tau": 0.07,
+    "bert_trainable_layers": 10,
+    "embed_tokens": 8,
+    "images_per_batch": 2,
+}
 
-# =====================================================================
-# 4. ABLATION CONTROL
-# =====================================================================
-# Four experiment conditions for the full ablation table:
-#
-#   Exp 1 - Baseline (plain LAVT, no contributions):
-#     Script: train_camus.py
-#     Settings: (this script ignores both flags below)
-#
-#   Exp 2 - Decoder cross-attention only (Contribution 1 alone):
-#     Script: train_camus_contrastive.py
-#     Settings: DECODE_WITH_LANG=True, CONTRASTIVE_WEIGHT=0.0
-#
-#   Exp 3 - Contrastive loss only (Contribution 2 alone):
-#     Script: train_camus_contrastive.py
-#     Settings: DECODE_WITH_LANG=False, CONTRASTIVE_WEIGHT=0.1
-#
-#   Exp 4 - Full CardioContrast (both contributions):
-#     Script: train_camus_contrastive.py
-#     Settings: DECODE_WITH_LANG=True, CONTRASTIVE_WEIGHT=0.1
-#
-# Comparisons:
-#   Exp 1 vs Exp 2 = isolates decoder CA contribution alone
-#   Exp 1 vs Exp 3 = isolates contrastive loss contribution alone
-#   Exp 2 vs Exp 4 = adds contrastive on top of CA
-#   Exp 3 vs Exp 4 = adds CA on top of contrastive
-#   Exp 1 vs Exp 4 = full CardioContrast improvement over baseline
+PRESETS = {
+    "exp1_baseline": {"decode_with_lang": False, "contrastive_weight": 0.0, "exp_name": "exp1_baseline"},
+    "exp2_decoder_ca": {"decode_with_lang": True, "contrastive_weight": 0.0, "exp_name": "exp2_decoder_ca"},
+    "exp3_contrastive": {"decode_with_lang": False, "contrastive_weight": 0.1, "exp_name": "exp3_contrastive"},
+    "exp4_cardiocontrast": {"decode_with_lang": True, "contrastive_weight": 0.1, "exp_name": "exp4_cardiocontrast"},
+    "exp5_class_embedding": {"decode_with_lang": False, "contrastive_weight": 0.1, "text_encoder": "embedding", "exp_name": "exp5_class_embedding"},
+    "exp6_paraphrase": {"decode_with_lang": True, "contrastive_weight": 0.1, "prompt_mode": "paraphrase", "exp_name": "exp6_paraphrase"},
+    "exp7_union_pool": {"decode_with_lang": True, "contrastive_weight": 0.1, "pool_region": "union", "exp_name": "exp7_union_pool"},
+}
 
-# DECODE_WITH_LANG: decoder cross-attention ablation switch (Contribution 1)
-# True  = language injected into decoder at every refinement stage
-# False = baseline decoder, no language conditioning in decoder
-DECODE_WITH_LANG = True
 
-# CONTRASTIVE_WEIGHT: contrastive loss ablation switch (Contribution 2)
-# 0.0 = contrastive loss OFF
-# 0.1 = contrastive loss ON (recommended value)
-CONTRASTIVE_WEIGHT = 0.0
+def git_hash():
+    try:
+        return subprocess.check_output(["git", "rev-parse", "--short", "HEAD"], text=True).strip()
+    except Exception:
+        return "unknown"
 
-# CONTRASTIVE_TAU: temperature for the contrastive repulsion loss.
-# Fixed at 0.07 following SimCLR. Ablate if reviewers ask.
-CONTRASTIVE_TAU = 0.07
 
-# =====================================================================
-# ENVIRONMENT INITIALIZER
-# =====================================================================
 def initialize_environment():
-    for d in [CHECKPOINT_DIR, OUTPUT_DIR, LOG_DIR]:
-        os.makedirs(d, exist_ok=True)
-    print("[*] Device          : {}".format(DEVICE))
-    print("[*] GPUs             : {}".format(GPU_IDS))
-    print("[*] Effective batch  : {} x {} = {}".format(
-        BATCH_SIZE, GRADIENT_ACCUMULATION_STEPS,
-        BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS))
-    print("[*] Contrastive      : {}".format(
-        "ON (weight={}, tau={})".format(CONTRASTIVE_WEIGHT, CONTRASTIVE_TAU)
-        if CONTRASTIVE_WEIGHT > 0 else "OFF"))
-    print("[*] Decoder CA       : {}".format(
-        "ON" if DECODE_WITH_LANG else "OFF (baseline decoder)"))
-    print("[*] CAMUS data dir   : {}".format(CAMUS_DATA_DIR))
+    os.makedirs(CC_OUTPUT_ROOT, exist_ok=True)
+    return {
+        "CAMUS_DATA_DIR": CAMUS_DATA_DIR,
+        "ECHONET_DATA_DIR": ECHONET_DATA_DIR,
+        "PRETRAINED_SWIN": PRETRAINED_SWIN,
+        "BERT_PATH": BERT_PATH,
+        "CC_OUTPUT_ROOT": CC_OUTPUT_ROOT,
+        "device": DEVICE,
+        "git_hash": git_hash(),
+    }
+
 
 if __name__ == "__main__":
-    initialize_environment()
+    print(initialize_environment())

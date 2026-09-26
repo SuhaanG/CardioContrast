@@ -1,96 +1,156 @@
-import os
 import glob
+import os
+import re
+
 import numpy as np
 import nibabel as nib
 import torch
-import torch.utils.data as data
 from PIL import Image
-from transformers import BertTokenizer
+from torch.utils import data
 
-STRUCTURE_PROMPTS = {
-    1: "the left ventricular endocardium",
-    2: "the myocardium",
-    3: "the left atrium",
-}
+from .prompts import CANONICAL, HELDOUT, STRUCTURES, TRAIN_BANK
+
+FILENAME_RE = re.compile(r"(patient\d+)_(2CH|4CH)_(ED|ES)_gt\.nii(\.gz)?$")
+
+
+def index_images(data_dir, split):
+    from .splits import get_split_patients
+
+    allowed = set(get_split_patients(data_dir, split))
+    records = []
+    for mask_path in sorted(glob.glob(os.path.join(data_dir, "patient*", "*_gt.nii*")) + glob.glob(os.path.join(data_dir, "*_gt.nii*"))):
+        if "half_sequence" in mask_path:
+            continue
+        base = os.path.basename(mask_path)
+        m = FILENAME_RE.match(base)
+        if m is None:
+            continue
+        patient, view, phase, _ = m.groups()
+        if patient not in allowed:
+            continue
+        image_candidates = [
+            mask_path.replace("_gt.nii.gz", ".nii.gz"),
+            mask_path.replace("_gt.nii", ".nii"),
+            mask_path.replace("_gt.nii.gz", ".nii"),
+        ]
+        image_path = next((p for p in image_candidates if os.path.exists(p)), None)
+        if image_path is None:
+            continue
+        records.append({"image_path": image_path, "mask_path": mask_path, "patient": patient, "view": view, "phase": phase})
+    return records
+
 
 class CAMUSDataset(data.Dataset):
-    """
-    Loads CAMUS image/mask pairs and produces one training example per
-    structure per image (Option A). Returns the same 4-tuple format as
-    LAVT's ReferDataset:
-        (img, target, tensor_embeddings, attention_mask)
-    """
-    def __init__(self, data_dir, bert_tokenizer="bert-base-uncased",
-                 image_transforms=None, max_tokens=20):
+    def __init__(self, data_dir, split="train", img_size=352, prompt_mode="fixed", eval_prompt_set="canonical", seed=42, epoch=0):
         self.data_dir = data_dir
-        self.image_transforms = image_transforms
-        self.max_tokens = max_tokens
-        self.tokenizer = BertTokenizer.from_pretrained(bert_tokenizer)
-        self.samples = self._build_index()
+        self.split = split
+        self.img_size = img_size
+        self.prompt_mode = prompt_mode
+        self.eval_prompt_set = eval_prompt_set
+        self.seed = seed
+        self.epoch = epoch
+        self.records = index_images(data_dir, split)
+        self.samples = []
+        for i, record in enumerate(self.records):
+            for structure in sorted(STRUCTURES):
+                self.samples.append({"record": record, "structure": structure, "image_idx": i, "prompt": CANONICAL[structure]})
+        self.tokenizer = None
+        self._prompt_tokens = {}
+        self._init_tokenizer()
 
-    def _build_index(self):
-        samples = []
-        mask_paths = glob.glob(
-            os.path.join(self.data_dir, "patient*", "*_gt.nii.gz")
-        )
-        # Sort for reproducibility: glob order varies by filesystem/OS.
-        # Without sorting, the seeded random_split produces different
-        # train/val splits on different machines.
-        mask_paths = sorted(mask_paths)
+    def _init_tokenizer(self):
+        try:
+            from transformers import BertTokenizer
 
-        for mask_path in mask_paths:
-            if "half_sequence" in mask_path:
-                continue
-            image_path = mask_path.replace("_gt.nii.gz", ".nii.gz")
-            if not os.path.exists(image_path):
-                continue
-            for label in STRUCTURE_PROMPTS.keys():
-                samples.append({
-                    "image_path": image_path,
-                    "mask_path":  mask_path,
-                    "label":      label,
-                    "prompt":     STRUCTURE_PROMPTS[label],
-                })
-        return samples
+            self.tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
+        except Exception:
+            self.tokenizer = None
+
+    def _encode_prompt(self, prompt):
+        if self.tokenizer is None:
+            input_ids = torch.zeros(16, dtype=torch.long)
+            attn_mask = torch.zeros(16, dtype=torch.long)
+            return input_ids, attn_mask
+        encoded = self.tokenizer(prompt, return_tensors="pt", padding="max_length", truncation=True, max_length=32)
+        return encoded["input_ids"][0].clone(), encoded["attention_mask"][0].clone()
+
+    def set_epoch(self, epoch):
+        self.epoch = epoch
+
+    def _load_nifti_2d(self, path):
+        arr = np.asarray(nib.load(path).get_fdata())
+        return np.squeeze(arr).astype(np.float32)
+
+    def _resolve_prompt(self, structure, image_idx):
+        if self.prompt_mode == "fixed":
+            return CANONICAL[structure]
+        if self.prompt_mode == "paraphrase":
+            rng = np.random.default_rng([self.seed, self.epoch, image_idx, structure])
+            bank = TRAIN_BANK[structure]
+            return bank[int(rng.integers(0, len(bank)))]
+        if self.eval_prompt_set == "heldout":
+            bank = HELDOUT[structure]
+            return bank[image_idx % len(bank)]
+        return CANONICAL[structure]
 
     def __len__(self):
         return len(self.samples)
 
-    def _load_nifti_2d(self, path):
-        arr = nib.load(path).get_fdata()
-        return np.squeeze(arr)
-
-    def _tokenize(self, sentence):
-        attention_mask   = [0] * self.max_tokens
-        padded_input_ids = [0] * self.max_tokens
-        input_ids = self.tokenizer.encode(text=sentence, add_special_tokens=True)
-        input_ids = input_ids[:self.max_tokens]
-        padded_input_ids[:len(input_ids)] = input_ids
-        attention_mask[:len(input_ids)]   = [1] * len(input_ids)
-        tensor_embeddings = torch.tensor(padded_input_ids).unsqueeze(0)
-        attention_mask    = torch.tensor(attention_mask).unsqueeze(0)
-        return tensor_embeddings, attention_mask
-
     def __getitem__(self, index):
-        s = self.samples[index]
+        sample = self.samples[index]
+        record = sample["record"]
+        structure = sample["structure"]
+        image_idx = sample["image_idx"]
+        prompt = self._resolve_prompt(structure, image_idx)
 
-        image = self._load_nifti_2d(s["image_path"]).astype(np.float32)
-        if image.max() > 0:
-            image = image / image.max() * 255.0
-        image = image.astype(np.uint8)
-        image = np.stack([image, image, image], axis=-1)
-        img   = Image.fromarray(image).convert("RGB")
+        image = self._load_nifti_2d(record["image_path"])
+        mask = self._load_nifti_2d(record["mask_path"])
+        foreground = np.zeros_like(mask, dtype=np.uint8)
+        foreground[mask == structure] = 1
 
-        full_mask = self._load_nifti_2d(s["mask_path"])
-        annot     = np.zeros(full_mask.shape)
-        annot[full_mask == s["label"]] = 1
-        annot = Image.fromarray(annot.astype(np.uint8), mode="P")
+        max_value = float(np.max(image)) if np.max(image) > 0 else 1.0
+        image_norm = image / max_value
+        image_pil = Image.fromarray(np.repeat(np.asarray(Image.fromarray(image_norm).resize((self.img_size, self.img_size), Image.BILINEAR))[:, :, None], 3, axis=2))
+        image_arr = np.asarray(image_pil).transpose(2, 0, 1).astype(np.float32)
+        image_arr = (image_arr - 0.485) / 0.229
 
-        if self.image_transforms is not None:
-            img, target = self.image_transforms(img, annot)
-        else:
-            target = annot
+        target = np.asarray(Image.fromarray(foreground.astype(np.uint8)).resize((self.img_size, self.img_size), Image.NEAREST), dtype=np.float32)
+        union = (mask > 0).astype(np.float32)
 
-        tensor_embeddings, attention_mask = self._tokenize(s["prompt"])
+        input_ids, attn_mask = self._encode_prompt(prompt)
+        return {
+            "image": torch.from_numpy(image_arr),
+            "target": torch.from_numpy(target),
+            "union": torch.from_numpy(union),
+            "input_ids": input_ids,
+            "attn_mask": attn_mask,
+            "class_id": torch.tensor(structure - 1, dtype=torch.long),
+            "structure": structure,
+            "image_idx": torch.tensor(image_idx, dtype=torch.long),
+            "prompt": prompt,
+            "patient": record["patient"],
+            "view": record["view"],
+            "phase": record["phase"],
+            "quality": 1.0,
+            "orig_size": image.shape,
+            "spacing": np.array([1.0, 1.0, 1.0], dtype=np.float32),
+        }
 
-        return img, target, tensor_embeddings, attention_mask
+    def load_full_res(self, image_idx):
+        record = self.records[image_idx]
+        mask = self._load_nifti_2d(record["mask_path"])
+        spacing = np.array([1.0, 1.0, 1.0], dtype=np.float32)
+        return mask, spacing
+
+    def image_groups(self):
+        groups = {}
+        for idx, sample in enumerate(self.samples):
+            groups.setdefault(sample["image_idx"], []).append(idx)
+        return groups
+
+    @property
+    def max_images(self):
+        return max(1, len(self.records))
+
+
+__all__ = ["CAMUSDataset", "index_images"]
