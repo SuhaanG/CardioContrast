@@ -87,11 +87,29 @@ def anatomical_repulsion_loss(z, image_ids, structure_ids, tau=0.07):
 
 
 class ContrastiveAnatomicalLoss(nn.Module):
+    """
+    proj_head:
+      'none' (default, v2): the loss acts on the pooled DECODER FEATURES directly.
+             Nothing but the decoder can reduce it, so it keeps shaping the
+             representation for the whole run.
+      'mlp'  (v1, original paper formulation): a 2-layer projection head.
+             Diagnosed failure: with pool_region='pred' the head alone places the
+             three prompt embeddings 120 deg apart (mean cos = -0.5, the floor)
+             within ~100 steps; the loss then sits at ~5e-5 for the rest of
+             training and sends almost no gradient to the network. Kept only as
+             an ablation.
+    With proj_head='none' and pool_region='union', the three prompts of an image
+    are pooled over the SAME pixels, so the loss can only fall if the decoder's
+    prompt-conditioned features at those pixels actually diverge.
+    """
     def __init__(self, in_dim, proj_hidden_dim=None, proj_out_dim=128, tau=0.07,
-                 pool_region="pred", detach_weights=True):
+                 pool_region="union", detach_weights=True, proj_head="none"):
         super().__init__()
         assert pool_region in ("pred", "gt", "union")
-        self.projection_head = ProjectionHead(in_dim, proj_hidden_dim, proj_out_dim)
+        assert proj_head in ("none", "mlp")
+        self.proj_head = proj_head
+        self.projection_head = (ProjectionHead(in_dim, proj_hidden_dim, proj_out_dim)
+                                if proj_head == "mlp" else nn.Identity())
         self.tau = tau
         self.pool_region = pool_region
         self.detach_weights = detach_weights

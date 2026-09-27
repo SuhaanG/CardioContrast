@@ -3,7 +3,7 @@
 Language-guided echocardiographic segmentation (CAMUS: LV endocardium, myocardium, left atrium), built on LAVT, with two additions:
 
 1. **Multi-stage decoder cross-attention**: language is re-injected at every decoder stage through a gated residual.
-2. **Contrastive anatomical repulsion loss**: decoder features for different structure prompts on the same image are pushed apart.
+2. **Contrastive anatomical repulsion loss**: decoder features for different structure prompts on the same image, pooled over the same pixels (union of the three structures), are pushed apart. The loss acts on the decoder features directly (no projection head); see `lib/contrastive.py` for why the v1 projection-head version was dropped.
 
 Out-of-distribution test: EchoNet-Dynamic (never used for training; LV labels only).
 
@@ -60,7 +60,7 @@ Every run: `python train_cardiocontrast.py --preset <name> --seed <s>` → `expe
 | `exp4_cardiocontrast` | on | on | BERT | Full method |
 | `exp5_class_embedding` | on | on | learned class table | **Does language matter?** |
 | `exp6_paraphrase` | on | on | BERT, paraphrase prompts | Language generalisation (evaluate with `--prompt_set heldout`) |
-| `exp7_union_pool` | on | on (union pooling) | BERT | Stricter version of the contrastive loss (same pixels for all prompts) |
+| `exp7_v1_projhead` | on | on (v1: projection head + predicted-mask pooling) | BERT | Ablation: the original loss formulation, which collapses to ~0 early in training |
 
 Order:
 

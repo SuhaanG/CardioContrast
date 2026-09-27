@@ -36,6 +36,9 @@ BERT_TRAINABLE_LAYERS = 10
 
 # Ablation presets. Every preset uses the SAME sampler, loss, augmentation and
 # schedule; only the listed fields differ.
+# Contrastive loss (v2, default for every preset below unless stated): applied to
+# the decoder features pooled over the union of the three structures, with NO
+# projection head (pool_region="union", proj_head="none").
 PRESETS = {
     # core 2x2 ablation
     "exp1_baseline":        dict(decode_with_lang=0, contrastive_weight=0.0),
@@ -48,7 +51,8 @@ PRESETS = {
     # language generalisation: train on paraphrases, test on held-out paraphrases
     "exp6_paraphrase":      dict(decode_with_lang=1, contrastive_weight=CONTRASTIVE_WEIGHT,
                                  prompt_mode="paraphrase"),
-    # pool on the union of structures (same pixels for every prompt)
-    "exp7_union_pool":      dict(decode_with_lang=1, contrastive_weight=CONTRASTIVE_WEIGHT,
-                                 pool_region="union"),
+    # v1 contrastive formulation (projection head + predicted-mask pooling).
+    # Ablation showing why v2 is needed: the v1 loss collapses to ~0 early.
+    "exp7_v1_projhead":     dict(decode_with_lang=1, contrastive_weight=CONTRASTIVE_WEIGHT,
+                                 pool_region="pred", proj_head="mlp"),
 }

@@ -68,8 +68,20 @@ def test_contrastive():
     # no negatives -> zero loss that still has a graph
     loss0, _, n0 = anatomical_repulsion_loss(z, torch.arange(6), st)
     assert n0 == 0 and loss0.item() == 0
+    # v2 default: no projection head -> no parameters; gradient reaches features
+    m2 = ContrastiveAnatomicalLoss(32)
+    assert m2.proj_head == "none" and m2.pool_region == "union"
+    assert sum(p.numel() for p in m2.parameters()) == 0
+    # identical non-negative features for all prompts -> loss stays well above 0
+    f_same = torch.rand(1, 32, 11, 11).repeat(3, 1, 1, 1).requires_grad_(True)
+    u = torch.ones(3, 44, 44)
+    l2, c2, _ = m2(f_same, torch.randn(3, 2, 44, 44), torch.zeros(3, dtype=torch.long),
+                   torch.tensor([1, 2, 3]), union=u)
+    assert c2 > 0.99 and l2.item() > 0.5, (c2, l2.item())
+    l2.backward()
+    assert f_same.grad is not None and f_same.grad.abs().sum() > 0
     for pool in ("pred", "gt", "union"):
-        m = ContrastiveAnatomicalLoss(32, 32, 16, pool_region=pool)
+        m = ContrastiveAnatomicalLoss(32, 32, 16, pool_region=pool, proj_head="mlp")
         feats = torch.randn(6, 32, 11, 11, requires_grad=True)
         logits = torch.randn(6, 2, 44, 44, requires_grad=True)
         tgt = (torch.rand(6, 44, 44) > 0.5).long()

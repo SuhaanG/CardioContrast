@@ -70,6 +70,8 @@ def get_args(argv=None):
     p.add_argument("--contrastive_weight", type=float, default=None)
     p.add_argument("--tau", type=float, default=config.CONTRASTIVE_TAU)
     p.add_argument("--pool_region", default=None, choices=["pred", "gt", "union"])
+    p.add_argument("--proj_head", default=None, choices=["none", "mlp"],
+                   help="none = loss on decoder features (v2, default); mlp = v1 ablation")
     p.add_argument("--no_detach_pool", action="store_true")
     p.add_argument("--text_encoder", default=None, choices=["bert", "embedding"])
     p.add_argument("--bert_trainable_layers", type=int, default=config.BERT_TRAINABLE_LAYERS)
@@ -93,8 +95,8 @@ def get_args(argv=None):
     args = p.parse_args(argv)
 
     # Resolve: explicit flag > preset > default
-    defaults = dict(decode_with_lang=1, contrastive_weight=0.0, pool_region="pred",
-                    text_encoder="bert", prompt_mode="fixed")
+    defaults = dict(decode_with_lang=1, contrastive_weight=0.0, pool_region="union",
+                    proj_head="none", text_encoder="bert", prompt_mode="fixed")
     preset = config.PRESETS[args.preset] if args.preset else {}
     for k, v in defaults.items():
         if getattr(args, k) is None:
@@ -262,8 +264,9 @@ def main(argv=None):
     print("Experiment      : {}  (seed {})".format(args.exp_name, args.seed))
     print("Decoder CA      : {}".format("ON" if args.decode_with_lang else "OFF"))
     print("Contrastive     : {}".format(
-        "ON (w={}, tau={}, pool={}, detach={})".format(
-            args.contrastive_weight, args.tau, args.pool_region, not args.no_detach_pool)
+        "ON (w={}, tau={}, pool={}, head={}, detach={})".format(
+            args.contrastive_weight, args.tau, args.pool_region, args.proj_head,
+            not args.no_detach_pool)
         if args.contrastive_weight > 0 else "OFF"))
     print("Text encoder    : {}   prompts: {}".format(args.text_encoder, args.prompt_mode))
     print("Output dir      : {}".format(run_dir))
@@ -298,7 +301,8 @@ def main(argv=None):
                         args.decode_with_lang, args.embed_tokens).to(args.device)
     hid = decoder_hidden_size(args.swin_type)
     cont = ContrastiveAnatomicalLoss(hid, hid, 128, args.tau, args.pool_region,
-                                     detach_weights=not args.no_detach_pool).to(args.device)
+                                     detach_weights=not args.no_detach_pool,
+                                     proj_head=args.proj_head).to(args.device)
 
     optimizer = build_optimizer(model, cont, args.lr, args.weight_decay)
     steps_per_epoch = (len(train_loader) + args.accum - 1) // args.accum
