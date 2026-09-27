@@ -103,6 +103,12 @@ def test_decoder_gate():
     a = dec(x4, x3, x2, x1)
     b = dec(x4, x3, x2, x1, lang_feat=lang, lang_mask=mask)
     assert torch.allclose(a, b, atol=1e-5), "gate=0 at init must equal the baseline decoder"
+    # no batch coupling: a sample's output must not depend on the rest of the batch
+    dec.train()
+    full = dec(x4, x3, x2, x1, lang_feat=lang, lang_mask=mask)
+    single = dec(x4[:1], x3[:1], x2[:1], x1[:1], lang_feat=lang[:1], lang_mask=mask[:1])
+    assert torch.allclose(full[:1], single, atol=1e-5), "decoder output depends on batch"
+    dec.eval()
     ca = DecoderCrossAttention(16, 768, 4)
     with torch.no_grad():
         ca.gate.fill_(1.0)

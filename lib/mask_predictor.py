@@ -63,12 +63,16 @@ class SimpleDecoding(nn.Module):
         c1_size = c4_dims // (factor ** 3)
         self.hidden_size = hidden_size
 
+        # GroupNorm, not BatchNorm: every training batch contains all three
+        # prompts of each image, so BatchNorm statistics would couple those samples
+        # (the known BN leakage problem in contrastive training) and make train-mode
+        # and eval-mode behaviour diverge. GroupNorm is per-sample.
         def block(cin):
             return nn.Sequential(
                 nn.Conv2d(cin, hidden_size, 3, padding=1, bias=False),
-                nn.BatchNorm2d(hidden_size), nn.ReLU(inplace=True),
+                nn.GroupNorm(32, hidden_size), nn.ReLU(inplace=True),
                 nn.Conv2d(hidden_size, hidden_size, 3, padding=1, bias=False),
-                nn.BatchNorm2d(hidden_size), nn.ReLU(inplace=True))
+                nn.GroupNorm(32, hidden_size), nn.ReLU(inplace=True))
 
         self.stage1 = block(c4_size + c3_size)
         self.stage2 = block(hidden_size + c2_size)

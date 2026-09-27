@@ -142,14 +142,15 @@ def to_device(batch, device):
             for k, v in batch.items()}
 
 
-def build_optimizer(model, contrastive_module, lr, wd, gate_lr_mult=100.0):
+def build_optimizer(model, contrastive_module, lr, wd, gate_lr_mult=10.0):
     no_decay, decay, gates = [], [], []
     for name, p in model.named_parameters():
         if not p.requires_grad:
             continue
         if name.endswith(".gate"):
-            # Zero-initialised tanh gates: at the backbone LR (5e-5) they would
-            # take thousands of steps to open, so they get a larger LR.
+            # Zero-initialised tanh gates get 10x the base LR so they can open.
+            # (100x let a gate jump from 0.01 to 0.49 within one epoch and
+            # destabilised training once the contrastive loss acted on the decoder.)
             gates.append(p)
         elif (p.ndim <= 1 or "norm" in name or "relative_position_bias_table" in name
                 or "absolute_pos_embed" in name or "text_encoder.table" in name):
